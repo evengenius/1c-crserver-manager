@@ -33,7 +33,7 @@ set -euo pipefail
 # --- Версия скрипта ---
 # При выпуске новой версии увеличить и закоммитить в репозиторий.
 # Используется для проверки обновлений (см. do_self_update).
-SCRIPT_VERSION="2.1.2"
+SCRIPT_VERSION="2.1.3"
 
 # --- Источник обновлений ---
 UPDATE_REPO="evengenius/1c-crserver-manager"
@@ -200,8 +200,9 @@ instance_load() {
         [[ "$line" =~ ^[[:space:]]*# ]] && continue
         [[ -z "${line//[[:space:]]/}" ]] && continue
         if [[ "$line" =~ ^[[:space:]]*([A-Z_][A-Z0-9_]*)=\"?([^\"]*)\"?[[:space:]]*$ ]]; then
-            key="${BASH_REMATCH[1]}"
-            val="${BASH_REMATCH[2]}"
+            # ${...:-} — подстраховка от unbound-var под set -u, см. validate_ip.
+            key="${BASH_REMATCH[1]:-}"
+            val="${BASH_REMATCH[2]:-}"
             case "$key" in
                 NAME)      ;; # информационно, имя берём из файла
                 VERSION)   INST_VERSION="$val" ;;
@@ -579,8 +580,8 @@ get_legacy_install() {
             [[ "$line" =~ ^[[:space:]]*# ]] && continue
             [[ -z "${line//[[:space:]]/}" ]] && continue
             if [[ "$line" =~ ^[[:space:]]*([A-Z_][A-Z0-9_]*)=\"?([^\"]*)\"?[[:space:]]*$ ]]; then
-                key="${BASH_REMATCH[1]}"
-                val="${BASH_REMATCH[2]}"
+                key="${BASH_REMATCH[1]:-}"
+                val="${BASH_REMATCH[2]:-}"
                 case "$key" in
                     REPO_DIR)  [[ -z "$LEGACY_REPO_DIR" ]] && LEGACY_REPO_DIR="$val" ;;
                     REPO_PORT) [[ -z "$LEGACY_PORT" ]]     && LEGACY_PORT="$val" ;;
@@ -2624,10 +2625,13 @@ validate_ip() {
         addr="$ip"
     fi
     [[ "$addr" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+)\.([0-9]+)$ ]] || return 1
-    local i
-    for i in 1 2 3 4; do
-        local oct="${BASH_REMATCH[$i]}"
-        # Запрет ведущих нулей (кроме одиночного "0") и значений > 255
+    # Сохраняем октеты сразу после матча: BASH_REMATCH глобальный, и под
+    # `set -u` индексы должны браться через ${...:-} (иначе unbound var).
+    local o1="${BASH_REMATCH[1]:-}" o2="${BASH_REMATCH[2]:-}"
+    local o3="${BASH_REMATCH[3]:-}" o4="${BASH_REMATCH[4]:-}"
+    local oct
+    for oct in "$o1" "$o2" "$o3" "$o4"; do
+        # Запрет ведущих нулей (кроме одиночного "0")
         [[ "$oct" =~ ^0[0-9]+$ ]] && return 1
         (( oct >= 0 && oct <= 255 )) || return 1
     done

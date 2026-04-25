@@ -7,7 +7,23 @@
 
 См. [ROADMAP.md](ROADMAP.md).
 
-## [2.1.2] — 2026-04-25
+## [2.1.3] — 2026-04-25
+
+### Hotfix
+- Меню «Файрвол → Добавить разрешённый IP» падало с
+  `BASH_REMATCH[$i]: unbound variable` под `set -u` сразу после ввода
+  адреса. Причина — обращение к `${BASH_REMATCH[$i]}` без подстановки
+  по умолчанию. На некоторых сборках bash 5.x под `set -u` это
+  трактуется как unbound, даже когда regex успешно совпал.
+  Исправлено в `validate_ip` (берём октеты сразу после `[[ =~ ]]` через
+  `${BASH_REMATCH[N]:-}`). Та же страховка добавлена в `instance_load`
+  и `get_legacy_install`, где парсится конфиг — на случай аналогичных
+  edge-cases при чтении файла.
+
+### Тесты
+- `validate_ip` покрыт 17 локальными кейсами: обычные IPv4, loopback,
+  all-zero/FF, подсети /0..32, граничные ошибки (octet > 255, /33,
+  /-1, ведущие нули, неполный/лишний октет, пустая строка, не-IP).
 
 ### CI
 - В git index `crserver-manager.sh` помечен как исполняемый (mode 100755).
@@ -194,7 +210,8 @@ REPO_DIR, LOG_DIR), своя версия платформы, свои хран�
 
 См. историю в `git log`.
 
-[Unreleased]: https://github.com/evengenius/1c-crserver-manager/compare/v2.1.2...HEAD
+[Unreleased]: https://github.com/evengenius/1c-crserver-manager/compare/v2.1.3...HEAD
+[2.1.3]: https://github.com/evengenius/1c-crserver-manager/compare/v2.1.2...v2.1.3
 [2.1.2]: https://github.com/evengenius/1c-crserver-manager/compare/v2.1.1...v2.1.2
 [2.1.1]: https://github.com/evengenius/1c-crserver-manager/compare/v2.1.0...v2.1.1
 [2.1.0]: https://github.com/evengenius/1c-crserver-manager/compare/v2.0.4...v2.1.0
