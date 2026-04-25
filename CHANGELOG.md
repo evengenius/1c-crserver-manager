@@ -7,6 +7,18 @@
 
 См. [ROADMAP.md](ROADMAP.md).
 
+## [2.1.2] — 2026-04-25
+
+### CI
+- В git index `crserver-manager.sh` помечен как исполняемый (mode 100755).
+  При checkout под Windows исполняемый бит не сохранялся, поэтому
+  `./crserver-manager.sh` падал с `Permission denied` в smoke-test
+  Docker-контейнера на Linux. Заодно smoke-test переписан на вызов через
+  `bash crserver-manager.sh` для устойчивости к похожим проблемам.
+- В smoke-test убран `apt-get update && install bash` — bash всегда
+  есть в `debian:12`, а update мог зависнуть/упасть при сетевых
+  проблемах CI и блокировать всю проверку.
+
 ## [2.1.1] — 2026-04-25
 
 ### Code quality
@@ -182,7 +194,8 @@ REPO_DIR, LOG_DIR), своя версия платформы, свои хран�
 
 См. историю в `git log`.
 
-[Unreleased]: https://github.com/evengenius/1c-crserver-manager/compare/v2.1.1...HEAD
+[Unreleased]: https://github.com/evengenius/1c-crserver-manager/compare/v2.1.2...HEAD
+[2.1.2]: https://github.com/evengenius/1c-crserver-manager/compare/v2.1.1...v2.1.2
 [2.1.1]: https://github.com/evengenius/1c-crserver-manager/compare/v2.1.0...v2.1.1
 [2.1.0]: https://github.com/evengenius/1c-crserver-manager/compare/v2.0.4...v2.1.0
 [2.0.4]: https://github.com/evengenius/1c-crserver-manager/compare/v2.0.3...v2.0.4

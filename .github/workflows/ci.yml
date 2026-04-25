@@ -48,12 +48,16 @@ jobs:
             debian:12 \
             bash -c '
               set -euo pipefail
-              apt-get update -qq && apt-get install -y -qq bash >/dev/null
+              # bash и так есть в debian:12 — apt-get не нужен (и может
+              # не сработать при сетевых проблемах CI). Если понадобятся
+              # дополнительные пакеты (iptables, locale), ставить их.
+              chmod +x crserver-manager.sh
               # Минимальный smoke: парсинг, отображение версии, help.
               bash -n crserver-manager.sh
-              # version и help работают без root, но check_root первый —
-              # обходим, запустив как root в контейнере. Они работают.
-              ./crserver-manager.sh version
-              ./crserver-manager.sh help >/dev/null
+              # version и help работают без root: обработчик стоит до
+              # check_root (см. v2.1.0). Запускаем через bash для
+              # устойчивости (не зависим от executable-бита).
+              bash crserver-manager.sh version
+              bash crserver-manager.sh help >/dev/null
               echo "smoke OK"
             '
