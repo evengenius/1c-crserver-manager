@@ -33,7 +33,7 @@ set -euo pipefail
 # --- Версия скрипта ---
 # При выпуске новой версии увеличить и закоммитить в репозиторий.
 # Используется для проверки обновлений (см. do_self_update).
-SCRIPT_VERSION="2.0.0"
+SCRIPT_VERSION="2.0.1"
 
 # --- Источник обновлений ---
 UPDATE_REPO="evengenius/1c-crserver-manager"
@@ -1258,12 +1258,13 @@ do_instance_delete() {
     systemctl stop "crserver@${name}.service" 2>/dev/null || true
     systemctl disable "crserver@${name}.service" 2>/dev/null || true
 
-    rm -f "${INSTANCES_DIR}/${name}.conf"
-    log_info "Конфиг удалён: ${INSTANCES_DIR}/${name}.conf"
-
-    # Per-instance цепочка файрвола, если есть
+    # ВАЖНО: чистим файрвол ДО удаления конфига — cleanup_instance_chain
+    # читает REPO_PORT из <name>.conf, чтобы найти INPUT-ссылки на per-instance цепочку.
     cleanup_instance_chain "$name"
     remove_input_for_port "$INST_PORT"
+
+    rm -f "${INSTANCES_DIR}/${name}.conf"
+    log_info "Конфиг удалён: ${INSTANCES_DIR}/${name}.conf"
 
     if [[ $purge -eq 1 ]]; then
         if [[ -d "$INST_REPO_DIR" ]]; then
@@ -2124,6 +2125,16 @@ do_repo_backup() {
     fi
     rm -f /tmp/crserver-tar.log
 
+    log_step "Проверка целостности архива..."
+    if ! tar -tzf "$archive" >/dev/null 2>&1; then
+        log_error "Архив повреждён (verify не прошёл) — удаляю"
+        rm -f "$archive"
+        if [[ $was_active -eq 1 ]]; then
+            systemctl start "$unit" 2>/dev/null || true
+        fi
+        return 1
+    fi
+
     local size
     size=$(du -sh "$archive" 2>/dev/null | awk '{print $1}')
     log_info "Бэкап создан: ${archive} [${size:-?}]"
@@ -2171,10 +2182,21 @@ do_repo_restore() {
     fi
 
     local archive="${backups[$((num - 1))]}"
-    local name
-    name=$(tar -tzf "$archive" 2>/dev/null | head -1 | cut -d/ -f1)
-    if [[ -z "$name" ]]; then
-        log_error "Не удалось прочитать имя хранилища из архива"
+    # Все записи архива должны лежать в одном top-level каталоге с допустимым именем.
+    local top_dirs name
+    top_dirs=$(tar -tzf "$archive" 2>/dev/null | awk -F/ 'NF>0 && $1!="" {print $1}' | sort -u)
+    if [[ -z "$top_dirs" ]]; then
+        log_error "Не удалось прочитать содержимое архива"
+        return 1
+    fi
+    if [[ $(printf '%s\n' "$top_dirs" | wc -l) -ne 1 ]]; then
+        log_error "Архив содержит несколько каталогов верхнего уровня — небезопасно для restore:"
+        printf '%s\n' "$top_dirs" | sed 's/^/    /'
+        return 1
+    fi
+    name="$top_dirs"
+    if ! validate_repo_name "$name"; then
+        log_error "Имя каталога в архиве не похоже на имя хранилища: '${name}'"
         return 1
     fi
 
@@ -2782,6 +2804,13 @@ do_backup() {
     fi
     rm -f /tmp/crserver-tar.log
 
+    log_step "Проверка целостности архива..."
+    if ! tar -tzf "$backup_file" >/dev/null 2>&1; then
+        log_error "Архив повреждён (verify не прошёл) — удаляю"
+        rm -f "$backup_file"
+        return 1
+    fi
+
     local size
     size=$(du -sh "$backup_file" 2>/dev/null | awk '{print $1}')
     log_info "Бэкап создан: ${backup_file} [${size:-?}]"
@@ -2892,11 +2921,18 @@ KEEP_DAYS=${keep_days}
 
 mkdir -p "\$BACKUP_DIR"
 timestamp=\$(date +%Y%m%d_%H%M%S)
+archive="\${BACKUP_DIR}/\${INST}_\${timestamp}.tar.gz"
 log_file="\${BACKUP_DIR}/.last-backup-\${INST}.log"
-if ! tar -czf "\${BACKUP_DIR}/\${INST}_\${timestamp}.tar.gz" \\
+if ! tar -czf "\$archive" \\
         -C "\$(dirname "\$REPO_DIR")" "\$(basename "\$REPO_DIR")" \\
         --ignore-failed-read 2>"\$log_file"; then
     logger -t crserver-backup "FAILED \${INST} at \${timestamp}, see \${log_file}"
+    rm -f "\$archive"
+    exit 1
+fi
+if ! tar -tzf "\$archive" >/dev/null 2>>"\$log_file"; then
+    logger -t crserver-backup "CORRUPT \${INST} at \${timestamp}, see \${log_file}"
+    rm -f "\$archive"
     exit 1
 fi
 find "\$BACKUP_DIR" -maxdepth 1 -name "\${INST}_*.tar.gz" -mtime +\${KEEP_DAYS} -delete 2>/dev/null
@@ -3478,9 +3514,12 @@ do_help() {
     echo ""
     echo "  Хранилища (берут REPO_DIR из текущего/выбранного инстанса):"
     echo "    sudo ./crserver-manager.sh repo list"
+    echo "    sudo ./crserver-manager.sh repo info <имя>"
     echo "    sudo ./crserver-manager.sh repo create <имя>"
     echo "    sudo ./crserver-manager.sh repo delete <имя>"
+    echo "    sudo ./crserver-manager.sh repo rename <старое> <новое>"
     echo "    sudo ./crserver-manager.sh repo backup <имя>"
+    echo "    sudo ./crserver-manager.sh repo restore <архив.tar.gz | имя_хранилища>"
     echo ""
     echo "  Обновление:"
     echo "    sudo ./crserver-manager.sh update [--check|--force]"
@@ -3687,9 +3726,10 @@ cli_instance() {
             instance_load "$name" || return 1
             systemctl stop "crserver@${name}.service" 2>/dev/null || true
             systemctl disable "crserver@${name}.service" 2>/dev/null || true
-            rm -f "${INSTANCES_DIR}/${name}.conf"
+            # cleanup ДО rm -f conf: cleanup_instance_chain читает порт из конфига.
             cleanup_instance_chain "$name"
             remove_input_for_port "$INST_PORT"
+            rm -f "${INSTANCES_DIR}/${name}.conf"
             if [[ $purge -eq 1 && -d "$INST_REPO_DIR" ]]; then
                 rm -rf "$INST_REPO_DIR" || log_warn "rm -rf не удался"
             fi
@@ -3811,25 +3851,39 @@ cli_run_on_instance() {
                         log_error "Использование: $0 [-i name] repo delete <имя>"
                         return 1
                     fi
+                    if ! validate_repo_name "$1"; then
+                        log_error "Недопустимое имя"
+                        return 1
+                    fi
                     local d="${INST_REPO_DIR}/$1"
                     if [[ ! -d "$d" ]]; then
                         log_error "Не найдено: $d"
                         return 1
                     fi
-                    local was_active=0
+                    local was_active=0 rm_rc=0
                     if systemctl is-active --quiet "$unit" 2>/dev/null; then
                         was_active=1
                         systemctl stop "$unit" 2>/dev/null || true
                         sleep 1
                     fi
-                    rm -rf "$d" && log_info "Удалено: $1"
+                    rm -rf "$d" || rm_rc=$?
                     if [[ $was_active -eq 1 ]]; then
-                        systemctl start "$unit" 2>/dev/null || true
+                        systemctl start "$unit" 2>/dev/null || \
+                            log_warn "Служба не стартовала — journalctl -u ${unit}"
                     fi
+                    if [[ $rm_rc -ne 0 ]]; then
+                        log_error "rm -rf завершился с ошибкой (код ${rm_rc})"
+                        return 1
+                    fi
+                    log_info "Удалено: $1"
                     ;;
                 backup)
                     if [[ -z "${1:-}" ]]; then
                         log_error "Использование: $0 [-i name] repo backup <имя>"
+                        return 1
+                    fi
+                    if ! validate_repo_name "$1"; then
+                        log_error "Недопустимое имя"
                         return 1
                     fi
                     local d="${INST_REPO_DIR}/$1"
@@ -3841,15 +3895,159 @@ cli_run_on_instance() {
                     local ts a
                     ts=$(date +%Y%m%d_%H%M%S)
                     a="${BACKUP_DIR}/${INST_NAME}_repo_${1}_${ts}.tar.gz"
-                    if tar -czf "$a" -C "$INST_REPO_DIR" "$1" 2>/dev/null; then
-                        log_info "Бэкап: $a"
-                    else
+                    if ! tar -czf "$a" -C "$INST_REPO_DIR" "$1" 2>/dev/null; then
                         log_error "tar не удался"
+                        rm -f "$a"
                         return 1
                     fi
+                    if ! tar -tzf "$a" >/dev/null 2>&1; then
+                        log_error "Архив повреждён (verify не прошёл)"
+                        rm -f "$a"
+                        return 1
+                    fi
+                    log_info "Бэкап: $a"
+                    ;;
+                rename)
+                    if [[ -z "${1:-}" || -z "${2:-}" ]]; then
+                        log_error "Использование: $0 [-i name] repo rename <старое> <новое>"
+                        return 1
+                    fi
+                    if ! validate_repo_name "$1" || ! validate_repo_name "$2"; then
+                        log_error "Недопустимое имя"
+                        return 1
+                    fi
+                    local old_dir="${INST_REPO_DIR}/$1"
+                    local new_dir="${INST_REPO_DIR}/$2"
+                    if [[ ! -d "$old_dir" ]]; then
+                        log_error "Не найдено: $old_dir"
+                        return 1
+                    fi
+                    if [[ -e "$new_dir" ]]; then
+                        log_error "Уже существует: $new_dir"
+                        return 1
+                    fi
+                    local was_active=0
+                    if systemctl is-active --quiet "$unit" 2>/dev/null; then
+                        was_active=1
+                        systemctl stop "$unit" 2>/dev/null || true
+                        sleep 1
+                    fi
+                    if ! mv "$old_dir" "$new_dir"; then
+                        log_error "mv не удался"
+                        if [[ $was_active -eq 1 ]]; then
+                            systemctl start "$unit" 2>/dev/null || true
+                        fi
+                        return 1
+                    fi
+                    if [[ $was_active -eq 1 ]]; then
+                        systemctl start "$unit" 2>/dev/null || \
+                            log_warn "Служба не стартовала — journalctl -u ${unit}"
+                    fi
+                    log_info "Переименовано: $1 → $2"
+                    ;;
+                info)
+                    if [[ -z "${1:-}" ]]; then
+                        log_error "Использование: $0 [-i name] repo info <имя>"
+                        return 1
+                    fi
+                    if ! validate_repo_name "$1"; then
+                        log_error "Недопустимое имя"
+                        return 1
+                    fi
+                    local d="${INST_REPO_DIR}/$1"
+                    if [[ ! -d "$d" ]]; then
+                        log_error "Не найдено: $d"
+                        return 1
+                    fi
+                    local ip_addr
+                    ip_addr=$(get_primary_ip)
+                    echo "name:    $1"
+                    echo "path:    $d"
+                    echo "url:     tcp://${ip_addr}:${INST_PORT}/$1"
+                    echo "size:    $(du -sh "$d" 2>/dev/null | awk '{print $1}')"
+                    echo "files:   $(find "$d" -type f 2>/dev/null | wc -l)"
+                    echo "owner:   $(stat -c '%U:%G' "$d" 2>/dev/null)"
+                    echo "mode:    $(stat -c '%a' "$d" 2>/dev/null)"
+                    echo "mtime:   $(stat -c '%y' "$d" 2>/dev/null | cut -d. -f1)"
+                    if repo_looks_initialized "$d"; then
+                        echo "status:  initialized"
+                    else
+                        echo "status:  empty"
+                    fi
+                    ;;
+                restore)
+                    # Использование: repo restore <архив|имя_файла>
+                    # Если передано полное имя файла — берём как есть. Иначе ищем в BACKUP_DIR
+                    # последний бэкап для этого имени хранилища у текущего инстанса.
+                    if [[ -z "${1:-}" ]]; then
+                        log_error "Использование: $0 [-i name] repo restore <архив.tar.gz | имя_хранилища>"
+                        return 1
+                    fi
+                    local archive=""
+                    if [[ -f "$1" ]]; then
+                        archive="$1"
+                    else
+                        if ! validate_repo_name "$1"; then
+                            log_error "Недопустимое имя или файл не найден: $1"
+                            return 1
+                        fi
+                        # Берём свежайший бэкап
+                        archive=$(find "$BACKUP_DIR" -maxdepth 1 \
+                            -name "${INST_NAME}_repo_${1}_*.tar.gz" -printf '%T@ %p\n' 2>/dev/null \
+                            | sort -nr | head -1 | cut -d' ' -f2-)
+                        if [[ -z "$archive" ]]; then
+                            log_error "Бэкапы для '${1}' не найдены в ${BACKUP_DIR}"
+                            return 1
+                        fi
+                    fi
+
+                    # Валидируем содержимое архива
+                    local top_dirs name
+                    top_dirs=$(tar -tzf "$archive" 2>/dev/null | awk -F/ 'NF>0 && $1!="" {print $1}' | sort -u)
+                    if [[ -z "$top_dirs" || $(printf '%s\n' "$top_dirs" | wc -l) -ne 1 ]]; then
+                        log_error "Архив пуст или содержит несколько top-level каталогов"
+                        return 1
+                    fi
+                    name="$top_dirs"
+                    if ! validate_repo_name "$name"; then
+                        log_error "Имя в архиве не похоже на имя хранилища: '${name}'"
+                        return 1
+                    fi
+
+                    local target="${INST_REPO_DIR}/${name}"
+                    local was_active=0
+                    if systemctl is-active --quiet "$unit" 2>/dev/null; then
+                        was_active=1
+                        systemctl stop "$unit" 2>/dev/null || true
+                        sleep 1
+                    fi
+                    local rollback_dir=""
+                    if [[ -e "$target" ]]; then
+                        rollback_dir="${target}.pre-restore.$(date +%s)"
+                        mv "$target" "$rollback_dir"
+                    fi
+                    if ! tar -xzf "$archive" -C "$INST_REPO_DIR" 2>/dev/null; then
+                        log_error "Ошибка распаковки"
+                        rm -rf "$target" 2>/dev/null || true
+                        [[ -n "$rollback_dir" ]] && mv "$rollback_dir" "$target"
+                        if [[ $was_active -eq 1 ]]; then
+                            systemctl start "$unit" 2>/dev/null || true
+                        fi
+                        return 1
+                    fi
+                    detect_1c_user
+                    if [[ -n "${SVC_USER:-}" && -n "${SVC_GROUP:-}" ]]; then
+                        chown -R "${SVC_USER}:${SVC_GROUP}" "$target" 2>/dev/null || true
+                    fi
+                    if [[ $was_active -eq 1 ]]; then
+                        systemctl start "$unit" 2>/dev/null || \
+                            log_warn "Служба не стартовала — journalctl -u ${unit}"
+                    fi
+                    log_info "Восстановлено: ${name} (из $(basename "$archive"))"
+                    [[ -n "$rollback_dir" ]] && echo "  Прежний вариант: ${rollback_dir}"
                     ;;
                 *)
-                    log_error "Использование: $0 [-i name] repo {list|create <имя>|delete <имя>|backup <имя>}"
+                    log_error "Использование: $0 [-i name] repo {list|info <имя>|create <имя>|delete <имя>|rename <ст> <нв>|backup <имя>|restore <архив|имя>}"
                     return 1
                     ;;
             esac
