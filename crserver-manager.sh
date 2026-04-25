@@ -33,7 +33,7 @@ set -euo pipefail
 # --- Версия скрипта ---
 # При выпуске новой версии увеличить и закоммитить в репозиторий.
 # Используется для проверки обновлений (см. do_self_update).
-SCRIPT_VERSION="2.0.1"
+SCRIPT_VERSION="2.0.2"
 
 # --- Источник обновлений ---
 UPDATE_REPO="evengenius/1c-crserver-manager"
@@ -190,6 +190,21 @@ instance_save() {
             return 1
         fi
     done
+    # REPO_DIR и LOG_DIR должны быть разными — иначе chown/rm на одном
+    # каталоге приведёт к катастрофе. Также LOG_DIR не должен быть
+    # внутри REPO_DIR (и наоборот).
+    if [[ "$INST_REPO_DIR" == "$INST_LOG_DIR" ]]; then
+        log_error "REPO_DIR и LOG_DIR не могут совпадать"
+        return 1
+    fi
+    if [[ "$INST_LOG_DIR" == "$INST_REPO_DIR"/* ]]; then
+        log_error "LOG_DIR (${INST_LOG_DIR}) не может быть внутри REPO_DIR (${INST_REPO_DIR})"
+        return 1
+    fi
+    if [[ "$INST_REPO_DIR" == "$INST_LOG_DIR"/* ]]; then
+        log_error "REPO_DIR (${INST_REPO_DIR}) не может быть внутри LOG_DIR (${INST_LOG_DIR})"
+        return 1
+    fi
 
     mkdir -p "$INSTANCES_DIR"
     local file="${INSTANCES_DIR}/${name}.conf"
@@ -350,13 +365,23 @@ cli_select_instance() {
 #  ОПРЕДЕЛЕНИЕ ПЛАТФОРМЫ И ВЕРСИЙ (глобально, не зависит от инстансов)
 # ============================================================================
 
+# Имя версии 1С: 8.3.NN.NNNN (точные четыре числа через точки).
+# Защита от path traversal в путях /opt/1cv8/x86_64/<ver>/ и packages/<ver>/.
+version_name_valid() {
+    local ver="$1"
+    [[ "$ver" =~ ^8\.3\.[0-9]+\.[0-9]+$ ]]
+}
+
 # Возвращает массив установленных версий (у которых есть crserver)
 get_installed_versions() {
     INSTALLED_VERSIONS=()
     if [[ -d /opt/1cv8/x86_64 ]]; then
+        local ver
         for dir in /opt/1cv8/x86_64/*/; do
             if [[ -f "${dir}crserver" ]]; then
-                INSTALLED_VERSIONS+=("$(basename "$dir")")
+                ver=$(basename "$dir")
+                version_name_valid "$ver" || continue
+                INSTALLED_VERSIONS+=("$ver")
             fi
         done
     fi
@@ -370,6 +395,7 @@ get_available_versions() {
         for dir in "$PACKAGES_DIR"/*/; do
             [[ -d "$dir" ]] || continue
             ver=$(basename "$dir")
+            version_name_valid "$ver" || continue
             crs_match=$(find "$dir" -maxdepth 1 -name '1c-enterprise-*-crs_*.deb' ! -name '*-nls*' 2>/dev/null | head -1)
             [[ -n "$crs_match" ]] && AVAILABLE_VERSIONS+=("$ver")
         done
@@ -378,6 +404,9 @@ get_available_versions() {
 
 validate_version_packages() {
     local ver="$1"
+    if ! version_name_valid "$ver"; then
+        return 1
+    fi
     local dir="${PACKAGES_DIR}/${ver}"
     [[ -d "$dir" ]] || return 1
     local kind found
@@ -841,20 +870,26 @@ install_version() {
     echo "    crs:    $(basename "$CRS_PKG")"
     echo ""
 
-    local pkg dpkg_failed=0
-    for pkg in "$COMMON_PKG" "$SERVER_PKG" "$WS_PKG" "$CRS_PKG"; do
-        if ! dpkg -i "$pkg" >/tmp/crserver-dpkg.log 2>&1; then
+    # Ставим все 4 пакета одной командой apt-get install — apt сам разрулит
+    # порядок установки и подтянет недостающие зависимости (libwebkit2gtk и
+    # пр.). Это надёжнее, чем серия dpkg -i + последующий install -f, при
+    # котором первая ошибка зависимостей рушит остальные пакеты.
+    local dpkg_failed=0
+    if ! DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            "$COMMON_PKG" "$SERVER_PKG" "$WS_PKG" "$CRS_PKG" \
+            >/tmp/crserver-dpkg.log 2>&1; then
+        log_warn "apt-get install для пакетов 1С завершился с ошибкой:"
+        tail -10 /tmp/crserver-dpkg.log | sed 's/^/    /'
+        # Запасной путь: попробуем dpkg+install -f (на случай старого apt без поддержки .deb пути).
+        local pkg
+        for pkg in "$COMMON_PKG" "$SERVER_PKG" "$WS_PKG" "$CRS_PKG"; do
+            dpkg -i "$pkg" >>/tmp/crserver-dpkg.log 2>&1 || dpkg_failed=1
+        done
+        if ! apt-get install -f -y -qq >>/tmp/crserver-dpkg.log 2>&1; then
             dpkg_failed=1
-            log_warn "dpkg -i $(basename "$pkg") завершился с ошибкой:"
-            tail -5 /tmp/crserver-dpkg.log | sed 's/^/    /'
         fi
-    done
-    rm -f /tmp/crserver-dpkg.log
-
-    if ! apt-get install -f -y -qq >/dev/null 2>&1; then
-        log_warn "apt-get install -f не смог автоматически починить зависимости"
-        dpkg_failed=1
     fi
+    rm -f /tmp/crserver-dpkg.log
 
     if [[ $dpkg_failed -eq 1 ]]; then
         log_warn "Установка пакетов прошла с ошибками, проверьте вывод выше"
@@ -1421,7 +1456,7 @@ do_instance_info() {
     echo "    Каталог:       ${INST_REPO_DIR}"
     echo "    Логи:          ${INST_LOG_DIR}"
     echo "    Адрес:         tcp://${ip_addr}:${INST_PORT}/<имя_хранилища>"
-    if ss -tln 2>/dev/null | grep -q ":${INST_PORT}\b"; then
+    if ss -tlnH 2>/dev/null | awk -v p=":${INST_PORT}" '$4 ~ p"$" {found=1} END {exit !found}'; then
         echo "    Порт слушается: да"
     else
         echo "    Порт слушается: нет"
@@ -1659,7 +1694,7 @@ do_full_install() {
         return 1
     fi
 
-    if ss -tlnp 2>/dev/null | grep -q ":${inst_port}"; then
+    if ss -tlnH 2>/dev/null | awk -v p=":${inst_port}" '$4 ~ p"$" {found=1} END {exit !found}'; then
         log_info "Порт ${inst_port} слушается"
     fi
 
@@ -1713,14 +1748,20 @@ do_full_uninstall() {
         return
     fi
 
+    # Под set -e ошибка любой команды прервала бы цикл и оставила
+    # недочищенные инстансы. Переход в режим "ошибки игнорируются":
+    # uninstall — уже terminal-операция, и лучше дочистить хоть что-то,
+    # чем застрять на середине.
+    set +e
     local n port
     for n in "${INSTANCES[@]+"${INSTANCES[@]}"}"; do
-        systemctl stop "crserver@${n}.service" 2>/dev/null || true
-        systemctl disable "crserver@${n}.service" 2>/dev/null || true
-        port=$(awk -F'"' '/^REPO_PORT=/ {print $2; exit}' "${INSTANCES_DIR}/${n}.conf" 2>/dev/null || true)
+        systemctl stop "crserver@${n}.service" 2>/dev/null
+        systemctl disable "crserver@${n}.service" 2>/dev/null
+        port=$(awk -F'"' '/^REPO_PORT=/ {print $2; exit}' "${INSTANCES_DIR}/${n}.conf" 2>/dev/null)
         [[ -n "$port" ]] && remove_input_for_port "$port"
         cleanup_instance_chain "$n"
     done
+    set -e
 
     rm -f "$SERVICE_TEMPLATE_FILE"
     systemctl daemon-reload
@@ -1986,7 +2027,8 @@ do_repo_info() {
 
     if command -v ss >/dev/null 2>&1; then
         local conns
-        conns=$(ss -tn 2>/dev/null | awk -v p=":${INST_PORT}" '$0 ~ p && $1=="ESTAB" {print}' | wc -l)
+        # 4-я колонка ss -tn — Local Address:Port. Точное совпадение по порту.
+        conns=$(ss -tnH 2>/dev/null | awk -v p=":${INST_PORT}" '$1=="ESTAB" && $4 ~ p"$"' | wc -l)
         echo "    Активных подключений к порту ${INST_PORT}: ${conns}"
     fi
 }
@@ -2267,6 +2309,10 @@ do_repo_check() {
     _select_repo_interactive || return
     local name="$repo_chosen"
     local dir="${INST_REPO_DIR}/${name}"
+    if [[ ! -d "$dir" ]]; then
+        log_error "Каталог хранилища не существует: ${dir}"
+        return 1
+    fi
     local issues=0
 
     echo ""
@@ -2336,16 +2382,19 @@ do_repo_check() {
 #     (плюс -j CRSERVER-<имя> при наличии).
 
 setup_firewall_chain() {
-    iptables -N "$IPTABLES_CHAIN" 2>/dev/null || iptables -F "$IPTABLES_CHAIN"
-    iptables -A "$IPTABLES_CHAIN" -s 127.0.0.1 -j ACCEPT
-    iptables -A "$IPTABLES_CHAIN" -j ACCEPT
-    save_iptables
+    # Создаёт цепочку CRSERVER если её нет. Существующую НЕ трогаем —
+    # иначе при пересоздании инстанса/реустановке потерялись бы whitelist-
+    # настройки администратора (см. фикс v2.0.2).
+    if ! iptables -L "$IPTABLES_CHAIN" -n &>/dev/null; then
+        iptables -N "$IPTABLES_CHAIN"
+        iptables -A "$IPTABLES_CHAIN" -s 127.0.0.1 -j ACCEPT
+        iptables -A "$IPTABLES_CHAIN" -j ACCEPT
+        save_iptables
+    fi
 }
 
 ensure_firewall_chain() {
-    if ! iptables -L "$IPTABLES_CHAIN" -n &>/dev/null; then
-        setup_firewall_chain
-    fi
+    setup_firewall_chain
 }
 
 cleanup_firewall() {
@@ -2391,7 +2440,10 @@ remove_input_for_port() {
 }
 
 chain_rule_count() {
-    iptables -S "$IPTABLES_CHAIN" 2>/dev/null | grep -c '^-A ' || true
+    # grep -c при отсутствии совпадений возвращает 0 и exit 1.
+    # Под set -e || true даёт пустой stdout — это ловушка для вызывающего.
+    # Подавляем exit-code через awk-обёртку, всегда печатаем число.
+    iptables -S "$IPTABLES_CHAIN" 2>/dev/null | awk '/^-A / {n++} END {print n+0}'
 }
 
 current_policy_mode() {
@@ -2434,7 +2486,9 @@ add_allowed_ip() {
     fi
     local total
     total=$(chain_rule_count)
-    if [[ $total -ge 1 ]]; then
+    total="${total:-0}"
+    if (( total >= 1 )); then
+        # Вставляем перед последним правилом (финальная политика ACCEPT/DROP).
         iptables -I "$IPTABLES_CHAIN" "$total" -s "$ip" -j ACCEPT
     else
         iptables -A "$IPTABLES_CHAIN" -s "$ip" -j ACCEPT
@@ -2453,14 +2507,33 @@ enable_whitelist_mode() {
 
 # Per-instance цепочка: CRSERVER-<имя>. Структура такая же, но без финального
 # полиси-правила (политика общая в CRSERVER).
+# iptables ограничивает имя цепочки 28 символами. Префикс "CRSERVER-" — 9,
+# значит на имя инстанса в этом контексте остаётся 19. instance_name_valid
+# допускает до 32 — для пер-инстанс цепочки требуется более жёсткая проверка.
+IPTABLES_CHAIN_MAX_LEN=28
+
 instance_chain_name() {
-    echo "CRSERVER-$1"
+    local name="$1"
+    if ! instance_name_valid "$name"; then
+        log_error "instance_chain_name: невалидное имя '${name}'" >&2
+        return 1
+    fi
+    local chain="CRSERVER-${name}"
+    if (( ${#chain} > IPTABLES_CHAIN_MAX_LEN )); then
+        log_error "Имя инстанса '${name}' слишком длинное для пер-инстанс цепочки iptables (макс. имя: $((IPTABLES_CHAIN_MAX_LEN - 9)) символов)" >&2
+        return 1
+    fi
+    echo "$chain"
 }
 
 setup_instance_chain() {
     local name="$1"
+    if ! instance_name_valid "$name"; then
+        log_error "setup_instance_chain: невалидное имя '${name}'"
+        return 1
+    fi
     local chain
-    chain=$(instance_chain_name "$name")
+    chain=$(instance_chain_name "$name") || return 1
     iptables -N "$chain" 2>/dev/null || iptables -F "$chain"
     iptables -A "$chain" -s 127.0.0.1 -j ACCEPT
     save_iptables
@@ -2468,8 +2541,12 @@ setup_instance_chain() {
 
 cleanup_instance_chain() {
     local name="$1"
+    if ! instance_name_valid "$name"; then
+        log_warn "cleanup_instance_chain: пропускаю — невалидное имя '${name}'"
+        return 0
+    fi
     local chain port
-    chain=$(instance_chain_name "$name")
+    chain=$(instance_chain_name "$name") || return 1
     port=$(awk -F'"' '/^REPO_PORT=/ {print $2; exit}' "${INSTANCES_DIR}/${name}.conf" 2>/dev/null || true)
     if [[ -n "$port" ]]; then
         while iptables -C INPUT -p tcp --dport "$port" -j "$chain" 2>/dev/null; do
@@ -2483,8 +2560,12 @@ cleanup_instance_chain() {
 
 add_allowed_ip_for_instance() {
     local name="$1" ip="$2"
+    if ! instance_name_valid "$name"; then
+        log_error "add_allowed_ip_for_instance: невалидное имя '${name}'"
+        return 1
+    fi
     local chain
-    chain=$(instance_chain_name "$name")
+    chain=$(instance_chain_name "$name") || return 1
     if ! iptables -L "$chain" -n &>/dev/null; then
         setup_instance_chain "$name"
         # Подцепляем INPUT
@@ -2917,7 +2998,7 @@ set -u
 INST="${INST_NAME}"
 BACKUP_DIR="${BACKUP_DIR}"
 REPO_DIR="${INST_REPO_DIR}"
-KEEP_DAYS=${keep_days}
+KEEP_DAYS="${keep_days}"
 
 mkdir -p "\$BACKUP_DIR"
 timestamp=\$(date +%Y%m%d_%H%M%S)
@@ -2935,7 +3016,7 @@ if ! tar -tzf "\$archive" >/dev/null 2>>"\$log_file"; then
     rm -f "\$archive"
     exit 1
 fi
-find "\$BACKUP_DIR" -maxdepth 1 -name "\${INST}_*.tar.gz" -mtime +\${KEEP_DAYS} -delete 2>/dev/null
+find "\$BACKUP_DIR" -maxdepth 1 -name "\${INST}_*.tar.gz" -mtime "+\${KEEP_DAYS}" -delete 2>/dev/null
 EOFCRON
 
     chmod +x "$cron_script"
@@ -3149,7 +3230,7 @@ do_diagnose() {
         issues=$((issues + 1))
     fi
 
-    if ss -tlnp 2>/dev/null | grep -q ":${INST_PORT}"; then
+    if ss -tlnH 2>/dev/null | awk -v p=":${INST_PORT}" '$4 ~ p"$" {found=1} END {exit !found}'; then
         log_info "Порт ${INST_PORT} слушается"
     else
         log_error "Порт ${INST_PORT} не слушается"
@@ -3798,7 +3879,7 @@ cli_run_on_instance() {
             ;;
         status)
             systemctl status "$unit" --no-pager || true
-            ss -tlnp 2>/dev/null | grep ":${INST_PORT}" || true
+            ss -tlnpH 2>/dev/null | awk -v p=":${INST_PORT}" '$4 ~ p"$"' || true
             ;;
         logs)
             journalctl -u "$unit" -n 50 --no-pager
