@@ -33,7 +33,7 @@ set -euo pipefail
 # --- Версия скрипта ---
 # При выпуске новой версии увеличить и закоммитить в репозиторий.
 # Используется для проверки обновлений (см. do_self_update).
-SCRIPT_VERSION="2.0.2"
+SCRIPT_VERSION="2.0.3"
 
 # --- Источник обновлений ---
 UPDATE_REPO="evengenius/1c-crserver-manager"
@@ -542,6 +542,10 @@ get_legacy_install() {
     LEGACY_REPO_DIR="${LEGACY_REPO_DIR:-/var/1c/repo}"
     LEGACY_PORT="${LEGACY_PORT:-1542}"
     LEGACY_LOG_DIR="${LEGACY_LOG_DIR:-/var/log/1c/crserver}"
+    # Юнит без распознаваемой версии — повреждённая установка, не "обнаружена".
+    if [[ -z "$LEGACY_VERSION" ]]; then
+        return 1
+    fi
     return 0
 }
 
@@ -557,6 +561,22 @@ move_dir_safe() {
         return 1
     fi
     mkdir -p "$(dirname "$dst")"
+
+    # Если src и dst на разных ФС — будет копирование. Проверим, что
+    # на целевой ФС хватит места. Сравниваем размер src в KiB и
+    # доступное место на dst в KiB.
+    local src_dev dst_dev
+    src_dev=$(stat -c '%d' "$src" 2>/dev/null || echo 0)
+    dst_dev=$(stat -c '%d' "$(dirname "$dst")" 2>/dev/null || echo 0)
+    if [[ "$src_dev" != "$dst_dev" ]]; then
+        local src_kb avail_kb
+        src_kb=$(du -sk "$src" 2>/dev/null | awk '{print $1+0}')
+        avail_kb=$(df --output=avail -k "$(dirname "$dst")" 2>/dev/null | awk 'NR==2 {print $1+0}')
+        if [[ -n "$src_kb" && -n "$avail_kb" && "$avail_kb" -lt "$src_kb" ]]; then
+            log_error "Недостаточно места на целевой ФС: нужно ${src_kb}K, доступно ${avail_kb}K"
+            return 1
+        fi
+    fi
     # Пробуем mv (быстро если та же FS)
     if mv "$src" "$dst" 2>/dev/null; then
         return 0
@@ -1213,6 +1233,19 @@ do_instance_create() {
             return
         fi
     done
+    # Дополнительно: порт может быть занят сторонним процессом (другой
+    # сервис, забытый процесс crserver, тестовый сокет и т.п.).
+    if command -v ss >/dev/null 2>&1; then
+        if ss -tlnH 2>/dev/null | awk -v p=":${port}" '$4 ~ p"$" {found=1} END {exit !found}'; then
+            log_warn "Порт ${port} уже слушается каким-то процессом:"
+            ss -tlnpH 2>/dev/null | awk -v p=":${port}" '$4 ~ p"$"' | sed 's/^/    /'
+            read -rp "  Всё равно создать инстанс? (y/N): " ans
+            if [[ ! "$ans" =~ ^[Yy]$ ]]; then
+                log_warn "Отменено"
+                return
+            fi
+        fi
+    fi
 
     local default_repo="${REPO_BASE}/repo-${name}"
     local default_log="${LOG_BASE}/${name}"
@@ -1338,6 +1371,26 @@ do_instance_edit() {
     echo "  Установленные версии: ${INSTALLED_VERSIONS[*]:-(нет)}"
     read -rp "  VERSION   [${INST_VERSION}]: " new_ver
     new_ver="${new_ver:-$INST_VERSION}"
+
+    # Понижение версии (8.3.30 -> 8.3.25) после того, как формат хранилища
+    # уже был обновлён конфигуратором, как правило необратимо: данные
+    # перестанут читаться. Предупреждаем явно.
+    if [[ "$new_ver" != "$INST_VERSION" ]]; then
+        local cur_ver_cmp new_ver_cmp
+        cur_ver_cmp=$(awk -F. '{printf "%03d%03d%03d%03d", $1,$2,$3,$4}' <<< "$INST_VERSION")
+        new_ver_cmp=$(awk -F. '{printf "%03d%03d%03d%03d", $1,$2,$3,$4}' <<< "$new_ver")
+        if [[ -n "$new_ver_cmp" && -n "$cur_ver_cmp" && "$new_ver_cmp" < "$cur_ver_cmp" ]]; then
+            echo ""
+            log_warn "Понижение версии: ${INST_VERSION} → ${new_ver}"
+            log_warn "Если формат хранилища уже обновлялся конфигуратором, понижение"
+            log_warn "может сделать данные нечитаемыми (это необратимо)."
+            read -rp "  Подтверждаете? (y/N): " ans
+            if [[ ! "$ans" =~ ^[Yy]$ ]]; then
+                log_warn "Отменено"
+                return
+            fi
+        fi
+    fi
 
     read -rp "  PORT      [${INST_PORT}]: " new_port
     new_port="${new_port:-$INST_PORT}"
@@ -2139,6 +2192,9 @@ do_repo_backup() {
     timestamp=$(date +%Y%m%d_%H%M%S)
     local archive="${BACKUP_DIR}/${INST_NAME}_repo_${name}_${timestamp}.tar.gz"
 
+    # Ctrl+C во время tar — удалить неполный архив
+    trap 'rm -f "$archive"; trap - INT TERM; exit 130' INT TERM
+
     local stop_service=0
     echo ""
     read -rp "  Остановить службу на время бэкапа (рекомендуется)? (Y/n): " ans
@@ -2160,6 +2216,7 @@ do_repo_backup() {
         log_error "tar завершился с ошибкой:"
         tail -5 /tmp/crserver-tar.log | sed 's/^/    /'
         rm -f /tmp/crserver-tar.log "$archive"
+        trap - INT TERM
         if [[ $was_active -eq 1 ]]; then
             systemctl start "$unit" 2>/dev/null || true
         fi
@@ -2171,11 +2228,13 @@ do_repo_backup() {
     if ! tar -tzf "$archive" >/dev/null 2>&1; then
         log_error "Архив повреждён (verify не прошёл) — удаляю"
         rm -f "$archive"
+        trap - INT TERM
         if [[ $was_active -eq 1 ]]; then
             systemctl start "$unit" 2>/dev/null || true
         fi
         return 1
     fi
+    trap - INT TERM
 
     local size
     size=$(du -sh "$archive" 2>/dev/null | awk '{print $1}')
@@ -2874,6 +2933,9 @@ do_backup() {
     timestamp=$(date +%Y%m%d_%H%M%S)
     backup_file="${BACKUP_DIR}/${INST_NAME}_${timestamp}.tar.gz"
 
+    # Ctrl+C / SIGTERM во время tar — удалить недописанный архив.
+    trap 'rm -f "$backup_file"; trap - INT TERM; exit 130' INT TERM
+
     log_step "Создание бэкапа инстанса ${INST_NAME}..."
     if ! tar -czf "$backup_file" \
             -C "$(dirname "$INST_REPO_DIR")" "$(basename "$INST_REPO_DIR")" \
@@ -2881,6 +2943,7 @@ do_backup() {
         log_error "Создание бэкапа не удалось:"
         tail -5 /tmp/crserver-tar.log | sed 's/^/    /'
         rm -f /tmp/crserver-tar.log "$backup_file"
+        trap - INT TERM
         return 1
     fi
     rm -f /tmp/crserver-tar.log
@@ -2889,8 +2952,10 @@ do_backup() {
     if ! tar -tzf "$backup_file" >/dev/null 2>&1; then
         log_error "Архив повреждён (verify не прошёл) — удаляю"
         rm -f "$backup_file"
+        trap - INT TERM
         return 1
     fi
+    trap - INT TERM
 
     local size
     size=$(du -sh "$backup_file" 2>/dev/null | awk '{print $1}')
@@ -3413,11 +3478,16 @@ download_remote_script() {
     echo "$tmp"
 }
 
+# Коды возврата do_self_update_check:
+#   0   — есть обновление (или удалённая новее)
+#   1   — сетевая/парсинговая ошибка (cron должен зафейлиться)
+#   100 — установлена актуальная версия (для cron — это успех, не ошибка)
+#   101 — локальная версия новее удалённой (тоже не ошибка)
 do_self_update_check() {
     log_step "Проверка обновлений..."
     echo "  Источник: ${UPDATE_URL}"
     local tmp
-    tmp=$(download_remote_script) || return 2
+    tmp=$(download_remote_script) || return 1
 
     local remote_ver
     remote_ver=$(extract_version "$tmp" || true)
@@ -3425,7 +3495,7 @@ do_self_update_check() {
 
     if [[ -z "$remote_ver" ]]; then
         log_error "Не удалось определить версию в удалённом скрипте"
-        return 2
+        return 1
     fi
 
     echo "  Текущая версия:  ${SCRIPT_VERSION}"
@@ -3437,9 +3507,9 @@ do_self_update_check() {
     set -e
 
     case $cmp in
-        0) log_info "Установлена актуальная версия"; return 1 ;;
+        0) log_info "Установлена актуальная версия"; return 100 ;;
         1) log_info "Доступно обновление"; return 0 ;;
-        2) log_warn "Локальная версия новее, чем в репозитории"; return 1 ;;
+        2) log_warn "Локальная версия новее, чем в репозитории"; return 101 ;;
     esac
 }
 
@@ -3976,16 +4046,20 @@ cli_run_on_instance() {
                     local ts a
                     ts=$(date +%Y%m%d_%H%M%S)
                     a="${BACKUP_DIR}/${INST_NAME}_repo_${1}_${ts}.tar.gz"
+                    trap 'rm -f "$a"; trap - INT TERM; exit 130' INT TERM
                     if ! tar -czf "$a" -C "$INST_REPO_DIR" "$1" 2>/dev/null; then
                         log_error "tar не удался"
                         rm -f "$a"
+                        trap - INT TERM
                         return 1
                     fi
                     if ! tar -tzf "$a" >/dev/null 2>&1; then
                         log_error "Архив повреждён (verify не прошёл)"
                         rm -f "$a"
+                        trap - INT TERM
                         return 1
                     fi
+                    trap - INT TERM
                     log_info "Бэкап: $a"
                     ;;
                 rename)
@@ -4148,14 +4222,33 @@ check_root
 
 # Парсим необязательный -i <name>
 CLI_INSTANCE=""
-if [[ "${1:-}" == "-i" || "${1:-}" == "--instance" ]]; then
-    if [[ -z "${2:-}" ]]; then
-        log_error "Опция -i требует имя инстанса"
-        exit 1
-    fi
-    CLI_INSTANCE="$2"
-    shift 2
-fi
+# -i/--instance может стоять в любой позиции аргументов (раньше только в
+# начале). Например: `crserver start -i dev30` теперь равнозначно
+# `crserver -i dev30 start`. Позиционные аргументы сохраняют порядок.
+__args=()
+__i=0
+while (( $# > 0 )); do
+    case "$1" in
+        -i|--instance)
+            if [[ -z "${2:-}" ]]; then
+                log_error "Опция $1 требует имя инстанса"
+                exit 1
+            fi
+            CLI_INSTANCE="$2"
+            shift 2
+            ;;
+        --)
+            shift
+            while (( $# > 0 )); do __args+=("$1"); shift; done
+            ;;
+        *)
+            __args+=("$1")
+            shift
+            ;;
+    esac
+done
+set -- "${__args[@]+"${__args[@]}"}"
+unset __args __i
 
 case "${1:-}" in
     install)       do_full_install ;;
@@ -4186,7 +4279,21 @@ case "${1:-}" in
     update)
         case "${2:-}" in
             ""|--yes|-y) do_self_update ;;
-            --check)     do_self_update_check || true ;;
+            --check)
+                # Преобразуем "семантические" exit-коды:
+                #   0   — есть обновление    -> exit 0
+                #   100 — актуальная версия  -> exit 0 (для cron — успех)
+                #   101 — локальная новее    -> exit 0
+                #   1   — ошибка проверки    -> exit 1
+                set +e
+                do_self_update_check
+                __rc=$?
+                set -e
+                case $__rc in
+                    0|100|101) exit 0 ;;
+                    *)         exit 1 ;;
+                esac
+                ;;
             --force)     do_self_update force ;;
             *)
                 log_error "Неизвестный аргумент: $2"
