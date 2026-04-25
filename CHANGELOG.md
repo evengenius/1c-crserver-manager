@@ -7,7 +7,19 @@
 
 См. [ROADMAP.md](ROADMAP.md).
 
-## [2.1.0] — 2026-04-25
+## [2.1.1] — 2026-04-25
+
+### Code quality
+- Скрипт чисто проходит shellcheck с `--severity=warning` (как настроено
+  в CI). Исправлены два предупреждения:
+  - `SC2168` (error): `local _size _entries` в case-ветке `verify` была
+    вне функции — заменено на обычные переменные с `unset` после.
+  - `SC2034`: переменная `BLUE` была определена, но нигде не использовалась —
+    удалена.
+- В `contrib/crserver.bash-completion` добавлен `# shellcheck disable=SC2207`
+  с комментарием о безопасности — `COMPREPLY=( $(compgen ...) )` это
+  стандартная идиома bash-completion, имена в системе (инстансы, версии,
+  хранилища) не содержат пробелов.
 
 ### Бэкапы
 - Ротация по числу копий: пункт меню «Оставить только последние N» и
@@ -170,7 +182,8 @@ REPO_DIR, LOG_DIR), своя версия платформы, свои хран�
 
 См. историю в `git log`.
 
-[Unreleased]: https://github.com/evengenius/1c-crserver-manager/compare/v2.1.0...HEAD
+[Unreleased]: https://github.com/evengenius/1c-crserver-manager/compare/v2.1.1...HEAD
+[2.1.1]: https://github.com/evengenius/1c-crserver-manager/compare/v2.1.0...v2.1.1
 [2.1.0]: https://github.com/evengenius/1c-crserver-manager/compare/v2.0.4...v2.1.0
 [2.0.4]: https://github.com/evengenius/1c-crserver-manager/compare/v2.0.3...v2.0.4
 [2.0.3]: https://github.com/evengenius/1c-crserver-manager/compare/v2.0.2...v2.0.3

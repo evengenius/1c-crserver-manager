@@ -33,7 +33,7 @@ set -euo pipefail
 # --- Версия скрипта ---
 # При выпуске новой версии увеличить и закоммитить в репозиторий.
 # Используется для проверки обновлений (см. do_self_update).
-SCRIPT_VERSION="2.1.0"
+SCRIPT_VERSION="2.1.1"
 
 # --- Источник обновлений ---
 UPDATE_REPO="evengenius/1c-crserver-manager"
@@ -69,12 +69,11 @@ PACKAGES_DIR="${SCRIPT_DIR}/${PACKAGES_DIR_NAME}"
 # --- Цвета ---
 # NO_COLOR (https://no-color.org/) или не-tty stdout — отключаем escape-коды.
 if [[ -n "${NO_COLOR:-}" ]] || [[ ! -t 1 ]]; then
-    RED=''; GREEN=''; YELLOW=''; BLUE=''; CYAN=''; BOLD=''; NC=''
+    RED=''; GREEN=''; YELLOW=''; CYAN=''; BOLD=''; NC=''
 else
     RED=$'\033[0;31m'
     GREEN=$'\033[0;32m'
     YELLOW=$'\033[1;33m'
-    BLUE=$'\033[0;34m'
     CYAN=$'\033[0;36m'
     BOLD=$'\033[1m'
     NC=$'\033[0m'
@@ -4552,10 +4551,10 @@ case "${1:-}" in
         fi
         echo "Проверяю $2..."
         if tar -tzf "$2" >/dev/null 2>&1; then
-            local _size _entries
-            _size=$(du -sh "$2" 2>/dev/null | awk '{print $1}')
-            _entries=$(tar -tzf "$2" 2>/dev/null | wc -l)
-            log_info "OK: архив целый, ${_entries} записей, размер ${_size:-?}"
+            __size=$(du -sh "$2" 2>/dev/null | awk '{print $1}')
+            __entries=$(tar -tzf "$2" 2>/dev/null | wc -l)
+            log_info "OK: архив целый, ${__entries} записей, размер ${__size:-?}"
+            unset __size __entries
             exit 0
         else
             log_error "FAIL: архив повреждён"

@@ -38,8 +38,10 @@
   и мониторинга (v2.0.4)
 - ⏳ Dry-run (`--dry-run`) для всех деструктивных операций
 - ✅ shellcheck в CI (v2.1.0): GitHub Actions workflow `.github/workflows/ci.yml`,
-  + bash-syntax-check + smoke-test в Docker debian:12. Локальная
-  shellcheck-чистота — в работе (постепенное устранение варнингов).
+  + bash-syntax-check + smoke-test в Docker debian:12.
+- ✅ shellcheck-чистота на уровне `--severity=warning` (v2.1.1) для основного
+  скрипта и bash-completion. Уровень `note`/`info` (SC2086, SC2015 и др.) —
+  отдельный инкрементальный процесс.
 
 ### Бэкапы
 - ✅ Ротация по числу копий, а не только по дням (v2.1.0): пункт меню

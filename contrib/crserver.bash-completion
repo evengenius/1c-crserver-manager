@@ -6,6 +6,11 @@
 #
 # Поддерживает корневые команды, instance/repo подкоманды, имена существующих
 # инстансов после -i и опций --version из реально установленных версий 1С.
+#
+# shellcheck disable=SC2207
+# COMPREPLY=( $(compgen ...) ) — стандартная идиома bash-completion.
+# В именах инстансов/версий/хранилищ нет пробелов (они валидируются регексом
+# в основном скрипте), поэтому word-splitting безопасен.
 
 _crserver_instances() {
     local d="/etc/1c-crserver/instances"
