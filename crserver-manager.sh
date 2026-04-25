@@ -25,7 +25,7 @@ set -euo pipefail
 # --- Версия скрипта ---
 # При выпуске новой версии увеличить и закоммитить в репозиторий.
 # Используется для проверки обновлений (см. do_self_update).
-SCRIPT_VERSION="1.3.0"
+SCRIPT_VERSION="1.3.1"
 
 # --- Источник обновлений ---
 UPDATE_REPO="evengenius/1c-crserver-manager"
@@ -2291,6 +2291,11 @@ do_help() {
     echo "      Создать/Подключиться к хранилищу"
     echo "    Адрес: tcp://IP_СЕРВЕРА:ПОРТ/имя_хранилища"
     echo ""
+    # Пауза только в интерактивном режиме (из меню), чтобы не задерживать
+    # CLI-вызов `crserver help` в скриптах/пайпах.
+    if [[ -t 0 && "${HELP_INTERACTIVE:-0}" -eq 1 ]]; then
+        read -rp "  Нажмите Enter..." _
+    fi
 }
 
 # ============================================================================
@@ -2354,7 +2359,7 @@ main_menu() {
             6) do_tools_menu ;;
             7) do_path_menu ;;
             8) do_update_menu ;;
-            9) do_help ;;
+            9) HELP_INTERACTIVE=1 do_help ;;
             0) echo ""; exit 0 ;;
             *) log_warn "Неверный выбор" ;;
         esac
