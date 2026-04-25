@@ -25,7 +25,7 @@ set -euo pipefail
 # --- Версия скрипта ---
 # При выпуске новой версии увеличить и закоммитить в репозиторий.
 # Используется для проверки обновлений (см. do_self_update).
-SCRIPT_VERSION="1.2.0"
+SCRIPT_VERSION="1.3.0"
 
 # --- Источник обновлений ---
 UPDATE_REPO="evengenius/1c-crserver-manager"
@@ -120,10 +120,15 @@ EOF
 #  ОПРЕДЕЛЕНИЕ ПЛАТФОРМЫ И ВЕРСИЙ
 # ============================================================================
 
-# Определяет активную версию (из systemd-службы)
+# Определяет активную версию (из systemd-службы).
+# Выставляет:
+#   ACTIVE_VERSION         — строка версии "8.3.X.Y" или ""
+#   ACTIVE_CRSERVER_BIN    — путь к бинарнику из ExecStart
+#   ACTIVE_VERSION_PHANTOM — 1 если в юните указана версия, бинарника которой нет
 detect_active_version() {
     ACTIVE_VERSION=""
     ACTIVE_CRSERVER_BIN=""
+    ACTIVE_VERSION_PHANTOM=0
 
     if [[ -f /etc/systemd/system/${SERVICE_NAME}.service ]]; then
         local exec_line
@@ -131,6 +136,10 @@ detect_active_version() {
         if [[ -n "$exec_line" ]]; then
             ACTIVE_CRSERVER_BIN=$(echo "$exec_line" | sed 's/^ExecStart=//' | awk '{print $1}')
             ACTIVE_VERSION=$(echo "$ACTIVE_CRSERVER_BIN" | grep -oP '8\.3\.\d+\.\d+' || true)
+            # Фантом: юнит ссылается на удалённый бинарник
+            if [[ -n "$ACTIVE_CRSERVER_BIN" && ! -f "$ACTIVE_CRSERVER_BIN" ]]; then
+                ACTIVE_VERSION_PHANTOM=1
+            fi
         fi
     fi
 
@@ -140,6 +149,7 @@ detect_active_version() {
             if [[ -f "${dir}crserver" ]]; then
                 ACTIVE_CRSERVER_BIN="${dir}crserver"
                 ACTIVE_VERSION=$(basename "$dir")
+                ACTIVE_VERSION_PHANTOM=0
                 break
             fi
         done
@@ -207,6 +217,47 @@ get_primary_ip() {
     echo "${ip:-127.0.0.1}"
 }
 
+# Однократная проверка целостности активной версии за сессию.
+# Если в systemd-юните указана версия с удалённым бинарником — предлагает
+# автоматически переключиться на установленную (если такая есть).
+PHANTOM_CHECK_DONE=0
+check_and_offer_phantom_fix() {
+    [[ "$PHANTOM_CHECK_DONE" -eq 1 ]] && return 0
+    [[ "$ACTIVE_VERSION_PHANTOM" -ne 1 ]] && { PHANTOM_CHECK_DONE=1; return 0; }
+
+    # Нашли проблему — показываем один раз
+    echo ""
+    log_warn "ОБНАРУЖЕНА ПРОБЛЕМА: активная версия в systemd-юните — фантом"
+    echo "    Юнит:     /etc/systemd/system/${SERVICE_NAME}.service"
+    echo "    Указана:  ${ACTIVE_VERSION}"
+    echo "    Бинарник: ${ACTIVE_CRSERVER_BIN} — НЕ СУЩЕСТВУЕТ"
+
+    if [[ ${#INSTALLED_VERSIONS[@]} -eq 0 ]]; then
+        log_warn "  Установленных версий нет — установите версию через меню."
+        echo ""
+        read -rp "  Нажмите Enter..." _
+        PHANTOM_CHECK_DONE=1
+        return 0
+    fi
+
+    local target="${INSTALLED_VERSIONS[0]}"
+    echo "    Доступна: ${target}"
+    echo ""
+    read -rp "  Переключить службу на ${target} сейчас? (Y/n): " ans
+    PHANTOM_CHECK_DONE=1
+    if [[ "$ans" =~ ^[Nn]$ ]]; then
+        log_warn "Пропущено. Переключите вручную через меню «Управление версиями»."
+        sleep 1
+        return 0
+    fi
+
+    switch_to_version "$target"
+    # Перечитываем состояние после фикса
+    detect_active_version
+    get_installed_versions
+    read -rp "  Нажмите Enter..." _
+}
+
 # ============================================================================
 #  УПРАВЛЕНИЕ ВЕРСИЯМИ — МЕНЮ
 # ============================================================================
@@ -226,7 +277,11 @@ do_version_menu() {
         # Активная версия
         echo -n "  Активная версия:  "
         if [[ -n "$ACTIVE_VERSION" ]]; then
-            echo -e "${GREEN}${ACTIVE_VERSION}${NC}"
+            if [[ "$ACTIVE_VERSION_PHANTOM" -eq 1 ]]; then
+                echo -e "${RED}${ACTIVE_VERSION} (фантом — бинарник удалён)${NC}"
+            else
+                echo -e "${GREEN}${ACTIVE_VERSION}${NC}"
+            fi
         else
             echo -e "${YELLOW}не установлена${NC}"
         fi
@@ -237,7 +292,7 @@ do_version_menu() {
             local first=1
             for v in "${INSTALLED_VERSIONS[@]}"; do
                 [[ $first -eq 0 ]] && echo -n ", "
-                if [[ "$v" == "$ACTIVE_VERSION" ]]; then
+                if [[ "$v" == "$ACTIVE_VERSION" && "$ACTIVE_VERSION_PHANTOM" -eq 0 ]]; then
                     echo -ne "${GREEN}${v}${NC} ◄"
                 else
                     echo -n "$v"
@@ -531,22 +586,56 @@ do_switch_version() {
     get_installed_versions
     detect_active_version
 
-    if [[ ${#INSTALLED_VERSIONS[@]} -lt 2 ]]; then
-        if [[ ${#INSTALLED_VERSIONS[@]} -eq 0 ]]; then
-            log_warn "Нет установленных версий"
+    if [[ ${#INSTALLED_VERSIONS[@]} -eq 0 ]]; then
+        log_warn "Нет установленных версий"
+        read -rp "  Нажмите Enter..." _
+        return
+    fi
+
+    # Спецслучай: ровно одна установленная версия.
+    # Если активная — фантом (юнит ссылается на удалённый бинарник),
+    # переключаемся на единственную реальную автоматически.
+    if [[ ${#INSTALLED_VERSIONS[@]} -eq 1 ]]; then
+        local only="${INSTALLED_VERSIONS[0]}"
+        if [[ "$ACTIVE_VERSION_PHANTOM" -eq 1 ]]; then
+            log_warn "Активная версия (${ACTIVE_VERSION}) указана в systemd-юните,"
+            log_warn "но её бинарник отсутствует. Доступна только: ${only}"
+            echo ""
+            read -rp "  Переключить службу на ${only}? (Y/n): " ans
+            if [[ "$ans" =~ ^[Nn]$ ]]; then
+                return
+            fi
+            switch_to_version "$only"
+            read -rp "  Нажмите Enter..." _
+            return
+        fi
+        if [[ "$only" == "$ACTIVE_VERSION" ]]; then
+            log_info "Установлена только одна версия (${only}), она уже активна"
         else
-            log_warn "Установлена только одна версия: ${INSTALLED_VERSIONS[0]}"
+            log_warn "Установлена только одна версия (${only}), но активная другая (${ACTIVE_VERSION})"
+            echo ""
+            read -rp "  Переключить службу на ${only}? (Y/n): " ans
+            if [[ "$ans" =~ ^[Nn]$ ]]; then
+                return
+            fi
+            switch_to_version "$only"
         fi
         read -rp "  Нажмите Enter..." _
         return
     fi
 
     echo ""
+    if [[ "$ACTIVE_VERSION_PHANTOM" -eq 1 ]]; then
+        log_warn "Внимание: активная версия в юните (${ACTIVE_VERSION}) — фантом (бинарник удалён)"
+        echo ""
+    fi
+
     echo "  Установленные версии:"
     local idx=0
+    local v
     for v in "${INSTALLED_VERSIONS[@]}"; do
         idx=$((idx + 1))
-        if [[ "$v" == "$ACTIVE_VERSION" ]]; then
+        if [[ "$v" == "$ACTIVE_VERSION" && "$ACTIVE_VERSION_PHANTOM" -eq 0 ]]; then
             echo -e "    ${idx}) ${v}  ${GREEN}← активная${NC}"
         else
             echo "    ${idx}) ${v}"
@@ -562,7 +651,8 @@ do_switch_version() {
     if [[ "$num" =~ ^[0-9]+$ ]] && [[ $num -ge 1 ]] && [[ $num -le ${#INSTALLED_VERSIONS[@]} ]]; then
         local selected="${INSTALLED_VERSIONS[$((num - 1))]}"
 
-        if [[ "$selected" == "$ACTIVE_VERSION" ]]; then
+        # Если активная — фантом, любое переключение оправдано (даже если совпадает имя)
+        if [[ "$selected" == "$ACTIVE_VERSION" && "$ACTIVE_VERSION_PHANTOM" -eq 0 ]]; then
             log_info "Версия ${selected} уже активна"
             read -rp "  Нажмите Enter..." _
             return
@@ -1787,6 +1877,17 @@ do_diagnose() {
         issues=$((issues + 1))
     fi
 
+    # Фантом активной версии — юнит ссылается на удалённый бинарник
+    if [[ "$ACTIVE_VERSION_PHANTOM" -eq 1 ]]; then
+        log_error "Активная версия (${ACTIVE_VERSION}) — ФАНТОМ: бинарник ${ACTIVE_CRSERVER_BIN} удалён"
+        if [[ ${#INSTALLED_VERSIONS[@]} -gt 0 ]]; then
+            echo "    → Запустите меню «Управление версиями» → Переключить — будет автофикс"
+        else
+            echo "    → Установите версию через «Управление версиями» → Установить"
+        fi
+        issues=$((issues + 1))
+    fi
+
     # Установленные версии
     if [[ ${#INSTALLED_VERSIONS[@]} -gt 0 ]]; then
         log_info "Установлено версий: ${#INSTALLED_VERSIONS[@]} (${INSTALLED_VERSIONS[*]})"
@@ -2201,6 +2302,8 @@ main_menu() {
         load_config
         detect_active_version
         get_installed_versions
+        # Авто-предложение фикса фантомной активной версии
+        check_and_offer_phantom_fix
 
         local status_text status_color
         if [[ ${#INSTALLED_VERSIONS[@]} -eq 0 ]]; then
@@ -2218,7 +2321,11 @@ main_menu() {
         echo ""
         echo -e "${BOLD}══════════════════════════════════════════════════${NC}"
         echo -e "${BOLD}  Сервер хранилища 1С:Предприятие${NC}   ${CYAN}v${SCRIPT_VERSION}${NC}"
-        echo -e "  Версия 1С: ${ACTIVE_VERSION:-—}   Статус: ${status_color}${status_text}${NC}"
+        local active_label="${ACTIVE_VERSION:-—}"
+        if [[ "$ACTIVE_VERSION_PHANTOM" -eq 1 ]]; then
+            active_label="${ACTIVE_VERSION} ${RED}(фантом — бинарник отсутствует)${NC}"
+        fi
+        echo -e "  Версия 1С: ${active_label}   Статус: ${status_color}${status_text}${NC}"
         if [[ ${#INSTALLED_VERSIONS[@]} -gt 1 ]]; then
             echo -e "  Установлено: ${INSTALLED_VERSIONS[*]}"
         fi
