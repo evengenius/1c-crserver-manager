@@ -25,7 +25,7 @@ set -euo pipefail
 # --- Версия скрипта ---
 # При выпуске новой версии увеличить и закоммитить в репозиторий.
 # Используется для проверки обновлений (см. do_self_update).
-SCRIPT_VERSION="1.3.1"
+SCRIPT_VERSION="1.3.2"
 
 # --- Источник обновлений ---
 UPDATE_REPO="evengenius/1c-crserver-manager"
@@ -2082,6 +2082,9 @@ version_compare() {
 }
 
 # Скачивает удалённый скрипт во временный файл. echo'ит путь к файлу.
+# raw.githubusercontent.com отдаёт ответ через Fastly CDN с TTL 5 минут —
+# без обхода кэша свежепушеные версии до 5 минут видны как старые.
+# Защита: query-параметр с timestamp + заголовки no-cache/pragma.
 download_remote_script() {
     if ! command -v curl >/dev/null 2>&1; then
         log_error "Для обновления нужен curl: apt-get install curl" >&2
@@ -2089,8 +2092,13 @@ download_remote_script() {
     fi
     local tmp
     tmp=$(mktemp /tmp/crserver-manager.new.XXXXXX) || return 1
+    local cache_buster="?_=$(date +%s)"
     local http_code
-    http_code=$(curl -fsSL --max-time 30 -o "$tmp" -w '%{http_code}' "$UPDATE_URL" 2>/dev/null || echo "000")
+    http_code=$(curl -fsSL --max-time 30 \
+        -H 'Cache-Control: no-cache' \
+        -H 'Pragma: no-cache' \
+        -o "$tmp" -w '%{http_code}' \
+        "${UPDATE_URL}${cache_buster}" 2>/dev/null || echo "000")
     if [[ "$http_code" != "200" ]] || [[ ! -s "$tmp" ]]; then
         log_error "Не удалось скачать обновление (HTTP ${http_code}) с ${UPDATE_URL}" >&2
         rm -f "$tmp"
@@ -2136,8 +2144,18 @@ do_self_update_check() {
 do_self_update() {
     local force="${1:-}"
 
-    local script_path
-    script_path="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
+    # Если скрипт запущен через симлинк (например, /usr/local/bin/crserver →
+    # /root/crserver-manager.sh) — обновляем РЕАЛЬНЫЙ файл, а не симлинк,
+    # иначе mv заменит симлинк обычным файлом и сломает раскладку.
+    local invoked_path script_path
+    invoked_path="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
+    if [[ -L "$invoked_path" ]]; then
+        script_path=$(readlink -f "$invoked_path")
+        log_info "Запущено через симлинк: ${invoked_path}"
+        log_info "Обновляю целевой файл:    ${script_path}"
+    else
+        script_path="$invoked_path"
+    fi
 
     if [[ ! -w "$script_path" ]]; then
         log_error "Нет прав на запись в ${script_path}"
