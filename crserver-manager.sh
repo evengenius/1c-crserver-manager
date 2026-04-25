@@ -25,7 +25,7 @@ set -euo pipefail
 # --- Версия скрипта ---
 # При выпуске новой версии увеличить и закоммитить в репозиторий.
 # Используется для проверки обновлений (см. do_self_update).
-SCRIPT_VERSION="1.3.2"
+SCRIPT_VERSION="1.4.0"
 
 # --- Источник обновлений ---
 UPDATE_REPO="evengenius/1c-crserver-manager"
@@ -1273,6 +1273,563 @@ EOF
 }
 
 # ============================================================================
+#  УПРАВЛЕНИЕ ХРАНИЛИЩАМИ
+# ============================================================================
+#
+# Хранилище 1С на сервере — это подкаталог в REPO_DIR/<имя>/. Внутри
+# присутствуют файлы вроде 1cv8ddb.lst, cache/, data/. Их структуру создаёт
+# и поддерживает конфигуратор 1С при первом подключении / работе.
+#
+# Скрипт умеет только файловые операции: создать пустой каталог-заготовку,
+# удалить, переименовать, бэкапить/восстанавливать конкретное хранилище,
+# показывать инфо. Создание структуры (инициализация хранилища) и работа
+# с историей версий — задача конфигуратора 1С.
+
+# Имя хранилища: только латиница/цифры/_/- , 1..64 символа
+validate_repo_name() {
+    local name="$1"
+    [[ -z "$name" ]] && return 1
+    [[ ${#name} -gt 64 ]] && return 1
+    [[ "$name" =~ ^[A-Za-z0-9_-]+$ ]] || return 1
+    return 0
+}
+
+# Возвращает массив существующих хранилищ через имя массива
+# Использование: get_repo_list arr_name
+get_repo_list() {
+    local _out_var="$1"
+    local _result=()
+    if [[ -d "$REPO_DIR" ]]; then
+        local _dir
+        for _dir in "$REPO_DIR"/*/; do
+            [[ -d "$_dir" ]] || continue
+            _result+=("$(basename "$_dir")")
+        done
+    fi
+    # Передаём массив через namedref
+    local -n _ref="$_out_var"
+    _ref=("${_result[@]+"${_result[@]}"}")
+}
+
+# Признаки «непустого» хранилища 1С — наличие хотя бы одного из файлов
+repo_looks_initialized() {
+    local dir="$1"
+    [[ -f "$dir/1cv8ddb.lst" ]] && return 0
+    [[ -d "$dir/cache" ]]      && return 0
+    [[ -d "$dir/data" ]]       && return 0
+    [[ -f "$dir/v8inforeg.lst" ]] && return 0
+    return 1
+}
+
+do_repo_menu() {
+    while true; do
+        local repos=()
+        get_repo_list repos
+        local ip_addr
+        ip_addr=$(get_primary_ip)
+
+        echo ""
+        echo -e "${BOLD}══════════════════════════════════════════════════${NC}"
+        echo -e "  Хранилища конфигураций"
+        echo -e "${BOLD}══════════════════════════════════════════════════${NC}"
+        echo "  Каталог: ${REPO_DIR}"
+        echo ""
+
+        if [[ ${#repos[@]} -eq 0 ]]; then
+            echo "  (хранилищ нет)"
+        else
+            echo "  Существующие:"
+            echo "  ─────────────────────────────────────────────"
+            local idx=0 r size status
+            for r in "${repos[@]}"; do
+                idx=$((idx + 1))
+                size=$(du -sh "${REPO_DIR}/${r}" 2>/dev/null | awk '{print $1}')
+                if repo_looks_initialized "${REPO_DIR}/${r}"; then
+                    status="${GREEN}init${NC}"
+                else
+                    status="${YELLOW}пусто${NC}"
+                fi
+                echo -e "    ${idx}) ${r}  [${size:-?}]  (${status})"
+                echo "       → tcp://${ip_addr}:${REPO_PORT}/${r}"
+            done
+        fi
+
+        echo ""
+        echo "  1) Подробный список (с числом файлов и датой)"
+        echo "  2) Подготовить новое хранилище (пустой каталог)"
+        echo "  3) Информация о хранилище"
+        echo "  4) Переименовать хранилище"
+        echo "  5) Удалить хранилище"
+        echo "  6) Бэкап хранилища (одного)"
+        echo "  7) Восстановить хранилище из бэкапа"
+        echo "  8) Проверить целостность"
+        echo ""
+        echo "  0) ← Назад"
+        echo ""
+        read -rp "  Выберите: " choice
+
+        case $choice in
+            1) do_repo_list_detailed; read -rp "  Нажмите Enter..." _ ;;
+            2) do_repo_create;        read -rp "  Нажмите Enter..." _ ;;
+            3) do_repo_info;          read -rp "  Нажмите Enter..." _ ;;
+            4) do_repo_rename;        read -rp "  Нажмите Enter..." _ ;;
+            5) do_repo_delete;        read -rp "  Нажмите Enter..." _ ;;
+            6) do_repo_backup;        read -rp "  Нажмите Enter..." _ ;;
+            7) do_repo_restore;       read -rp "  Нажмите Enter..." _ ;;
+            8) do_repo_check;         read -rp "  Нажмите Enter..." _ ;;
+            0) return ;;
+            *) log_warn "Неверный выбор" ;;
+        esac
+    done
+}
+
+do_repo_list_detailed() {
+    local repos=()
+    get_repo_list repos
+    if [[ ${#repos[@]} -eq 0 ]]; then
+        echo ""
+        echo "  (хранилищ нет)"
+        return
+    fi
+
+    local ip_addr
+    ip_addr=$(get_primary_ip)
+    echo ""
+    printf "  %-24s %8s %8s %12s  %s\n" "Имя" "Размер" "Файлов" "Изменено" "Статус"
+    echo "  ─────────────────────────────────────────────────────────────────────"
+    local r dir size files mtime status
+    for r in "${repos[@]}"; do
+        dir="${REPO_DIR}/${r}"
+        size=$(du -sh "$dir" 2>/dev/null | awk '{print $1}')
+        files=$(find "$dir" -type f 2>/dev/null | wc -l)
+        mtime=$(stat -c '%y' "$dir" 2>/dev/null | cut -d. -f1 | cut -d' ' -f1)
+        if repo_looks_initialized "$dir"; then
+            status="init"
+        else
+            status="пусто"
+        fi
+        printf "  %-24s %8s %8s %12s  %s\n" "$r" "${size:-?}" "${files:-0}" "${mtime:-?}" "$status"
+    done
+    echo ""
+    echo "  Подключение из конфигуратора:"
+    echo "    tcp://${ip_addr}:${REPO_PORT}/<имя>"
+}
+
+do_repo_create() {
+    echo ""
+    read -rp "  Имя нового хранилища (латиница/цифры/_-, до 64 символов): " name
+    if ! validate_repo_name "$name"; then
+        log_error "Недопустимое имя"
+        return 1
+    fi
+    local dir="${REPO_DIR}/${name}"
+    if [[ -e "$dir" ]]; then
+        log_error "Хранилище с таким именем уже существует: ${dir}"
+        return 1
+    fi
+
+    detect_1c_user
+    if [[ -z "$SVC_USER" || -z "$SVC_GROUP" ]]; then
+        log_error "Не определён пользователь usr1cv8 — выполните установку"
+        return 1
+    fi
+
+    mkdir -p "$dir"
+    chown "${SVC_USER}:${SVC_GROUP}" "$dir"
+    chmod 750 "$dir"
+
+    log_info "Каталог создан: ${dir}"
+    echo ""
+    echo "  Это пустая ЗАГОТОВКА. Структура хранилища создаётся конфигуратором"
+    echo "  при первом подключении:"
+    echo ""
+    echo "    Конфигурация → Хранилище конфигурации → Создать хранилище"
+    local ip_addr
+    ip_addr=$(get_primary_ip)
+    echo "    Адрес: tcp://${ip_addr}:${REPO_PORT}/${name}"
+}
+
+# Возвращает имя хранилища через переменную repo_chosen, либо ""
+_select_repo_interactive() {
+    repo_chosen=""
+    local repos=()
+    get_repo_list repos
+    if [[ ${#repos[@]} -eq 0 ]]; then
+        log_warn "Хранилищ нет"
+        return 1
+    fi
+    echo ""
+    echo "  Выберите хранилище:"
+    local idx=0 r
+    for r in "${repos[@]}"; do
+        idx=$((idx + 1))
+        echo "    ${idx}) ${r}"
+    done
+    echo ""
+    read -rp "  Номер (или 0 для отмены): " num
+    if [[ "$num" == "0" || -z "$num" ]]; then
+        return 1
+    fi
+    if [[ "$num" =~ ^[0-9]+$ ]] && (( num >= 1 && num <= ${#repos[@]} )); then
+        repo_chosen="${repos[$((num - 1))]}"
+        return 0
+    fi
+    log_error "Неверный номер"
+    return 1
+}
+
+do_repo_info() {
+    local repo_chosen=""
+    _select_repo_interactive || return
+    local dir="${REPO_DIR}/${repo_chosen}"
+    local ip_addr
+    ip_addr=$(get_primary_ip)
+
+    echo ""
+    echo "  Информация о хранилище '${repo_chosen}'"
+    echo "  ─────────────────────────────────────────────"
+    echo "    Путь:       ${dir}"
+    echo "    Адрес:      tcp://${ip_addr}:${REPO_PORT}/${repo_chosen}"
+    echo "    Размер:     $(du -sh "$dir" 2>/dev/null | awk '{print $1}')"
+    echo "    Файлов:     $(find "$dir" -type f 2>/dev/null | wc -l)"
+    echo "    Каталогов:  $(find "$dir" -type d 2>/dev/null | wc -l)"
+    echo "    Изменён:    $(stat -c '%y' "$dir" 2>/dev/null | cut -d. -f1)"
+    echo "    Владелец:   $(stat -c '%U:%G' "$dir" 2>/dev/null)"
+    echo "    Права:      $(stat -c '%a' "$dir" 2>/dev/null)"
+    if repo_looks_initialized "$dir"; then
+        echo "    Статус:     инициализировано"
+    else
+        echo "    Статус:     пустая заготовка"
+    fi
+
+    # Активные подключения к порту (грубо — все, не различим конкретное хранилище)
+    if command -v ss >/dev/null 2>&1; then
+        local conns
+        conns=$(ss -tn 2>/dev/null | awk -v p=":${REPO_PORT}" '$0 ~ p && $1=="ESTAB" {print}' | wc -l)
+        echo "    Активных подключений к порту ${REPO_PORT}: ${conns}"
+    fi
+}
+
+do_repo_rename() {
+    local repo_chosen=""
+    _select_repo_interactive || return
+    local old_name="$repo_chosen"
+    local old_dir="${REPO_DIR}/${old_name}"
+
+    echo ""
+    log_warn "Переименование разорвёт URL подключения у клиентов!"
+    echo "    Было:   tcp://...:${REPO_PORT}/${old_name}"
+    read -rp "  Новое имя: " new_name
+    if ! validate_repo_name "$new_name"; then
+        log_error "Недопустимое имя"
+        return 1
+    fi
+    if [[ "$new_name" == "$old_name" ]]; then
+        log_warn "Имя не изменилось"
+        return
+    fi
+    local new_dir="${REPO_DIR}/${new_name}"
+    if [[ -e "$new_dir" ]]; then
+        log_error "Хранилище с таким именем уже существует"
+        return 1
+    fi
+
+    # Останавливаем службу — переименование на горячую может повредить открытые сессии
+    local was_active=0
+    if systemctl is-active --quiet ${SERVICE_NAME} 2>/dev/null; then
+        was_active=1
+        log_step "Остановка службы..."
+        systemctl stop ${SERVICE_NAME} 2>/dev/null || true
+        sleep 1
+    fi
+
+    if ! mv "$old_dir" "$new_dir"; then
+        log_error "mv не удался"
+        if [[ $was_active -eq 1 ]]; then
+            systemctl start ${SERVICE_NAME} 2>/dev/null || true
+        fi
+        return 1
+    fi
+
+    if [[ $was_active -eq 1 ]]; then
+        systemctl start ${SERVICE_NAME} 2>/dev/null || \
+            log_warn "Служба не стартовала — проверьте journalctl"
+    fi
+
+    local ip_addr
+    ip_addr=$(get_primary_ip)
+    log_info "Переименовано: ${old_name} → ${new_name}"
+    echo "    Стало: tcp://${ip_addr}:${REPO_PORT}/${new_name}"
+}
+
+do_repo_delete() {
+    local repo_chosen=""
+    _select_repo_interactive || return
+    local name="$repo_chosen"
+    local dir="${REPO_DIR}/${name}"
+
+    echo ""
+    echo "  Будет УДАЛЁН каталог:"
+    echo "    ${dir}"
+    echo "  Размер: $(du -sh "$dir" 2>/dev/null | awk '{print $1}')"
+    echo ""
+    log_warn "Это необратимо. Рекомендуется сначала сделать бэкап (пункт 6)."
+    echo ""
+    read -rp "  Введите имя хранилища '${name}' для подтверждения: " confirm
+    if [[ "$confirm" != "$name" ]]; then
+        log_warn "Отменено (имя не совпало)"
+        return
+    fi
+
+    # Останавливаем службу
+    local was_active=0
+    if systemctl is-active --quiet ${SERVICE_NAME} 2>/dev/null; then
+        was_active=1
+        log_step "Остановка службы..."
+        systemctl stop ${SERVICE_NAME} 2>/dev/null || true
+        sleep 1
+    fi
+
+    if ! rm -rf "$dir"; then
+        log_error "rm -rf завершился с ошибкой"
+        if [[ $was_active -eq 1 ]]; then
+            systemctl start ${SERVICE_NAME} 2>/dev/null || true
+        fi
+        return 1
+    fi
+    log_info "Удалено: ${name}"
+
+    if [[ $was_active -eq 1 ]]; then
+        systemctl start ${SERVICE_NAME} 2>/dev/null || \
+            log_warn "Служба не стартовала — проверьте journalctl"
+    fi
+}
+
+do_repo_backup() {
+    local repo_chosen=""
+    _select_repo_interactive || return
+    local name="$repo_chosen"
+    local src="${REPO_DIR}/${name}"
+
+    mkdir -p "$BACKUP_DIR"
+    local timestamp
+    timestamp=$(date +%Y%m%d_%H%M%S)
+    local archive="${BACKUP_DIR}/repo_${name}_${timestamp}.tar.gz"
+
+    # Опционально приостановить службу для консистентного снимка
+    local stop_service=0
+    echo ""
+    read -rp "  Остановить службу на время бэкапа (рекомендуется)? (Y/n): " ans
+    if [[ ! "$ans" =~ ^[Nn]$ ]]; then
+        stop_service=1
+    fi
+
+    local was_active=0
+    if [[ $stop_service -eq 1 ]] && systemctl is-active --quiet ${SERVICE_NAME} 2>/dev/null; then
+        was_active=1
+        log_step "Остановка службы..."
+        systemctl stop ${SERVICE_NAME} 2>/dev/null || true
+        sleep 1
+    fi
+
+    log_step "Создание архива ${archive}..."
+    if ! tar -czf "$archive" -C "$REPO_DIR" "$name" 2>/tmp/crserver-tar.log; then
+        log_error "tar завершился с ошибкой:"
+        tail -5 /tmp/crserver-tar.log | sed 's/^/    /'
+        rm -f /tmp/crserver-tar.log "$archive"
+        if [[ $was_active -eq 1 ]]; then
+            systemctl start ${SERVICE_NAME} 2>/dev/null || true
+        fi
+        return 1
+    fi
+    rm -f /tmp/crserver-tar.log
+
+    local size
+    size=$(du -sh "$archive" 2>/dev/null | awk '{print $1}')
+    log_info "Бэкап создан: ${archive} [${size:-?}]"
+
+    if [[ $was_active -eq 1 ]]; then
+        systemctl start ${SERVICE_NAME} 2>/dev/null || \
+            log_warn "Служба не стартовала — проверьте journalctl"
+    fi
+}
+
+do_repo_restore() {
+    if [[ ! -d "$BACKUP_DIR" ]]; then
+        log_warn "Каталог бэкапов не существует: ${BACKUP_DIR}"
+        return
+    fi
+
+    # Только архивы вида repo_<имя>_<timestamp>.tar.gz
+    local backups=()
+    local f
+    for f in "$BACKUP_DIR"/repo_*.tar.gz; do
+        [[ -f "$f" ]] && backups+=("$f")
+    done
+    if [[ ${#backups[@]} -eq 0 ]]; then
+        log_warn "Нет бэкапов отдельных хранилищ (repo_*.tar.gz) в ${BACKUP_DIR}"
+        echo "  Создайте сначала через пункт 6."
+        return
+    fi
+
+    echo ""
+    echo "  Доступные бэкапы:"
+    local idx=0 size
+    for f in "${backups[@]}"; do
+        idx=$((idx + 1))
+        size=$(du -sh "$f" 2>/dev/null | awk '{print $1}')
+        echo "    ${idx}) $(basename "$f")  [${size:-?}]"
+    done
+    echo ""
+    read -rp "  Номер бэкапа (или 0): " num
+    if [[ "$num" == "0" || -z "$num" ]]; then
+        return
+    fi
+    if ! [[ "$num" =~ ^[0-9]+$ ]] || (( num < 1 || num > ${#backups[@]} )); then
+        log_error "Неверный номер"
+        return 1
+    fi
+
+    local archive="${backups[$((num - 1))]}"
+    # Имя хранилища = верхний каталог в архиве
+    local name
+    name=$(tar -tzf "$archive" 2>/dev/null | head -1 | cut -d/ -f1)
+    if [[ -z "$name" ]]; then
+        log_error "Не удалось прочитать имя хранилища из архива"
+        return 1
+    fi
+
+    echo ""
+    echo "  Архив:      $(basename "$archive")"
+    echo "  Хранилище:  ${name}"
+    local target="${REPO_DIR}/${name}"
+    if [[ -e "$target" ]]; then
+        echo ""
+        log_warn "Хранилище '${name}' уже существует и БУДЕТ ЗАМЕНЕНО"
+        read -rp "  Введите '${name}' для подтверждения замены: " confirm
+        if [[ "$confirm" != "$name" ]]; then
+            log_warn "Отменено"
+            return
+        fi
+    fi
+
+    # Останавливаем службу
+    local was_active=0
+    if systemctl is-active --quiet ${SERVICE_NAME} 2>/dev/null; then
+        was_active=1
+        log_step "Остановка службы..."
+        systemctl stop ${SERVICE_NAME} 2>/dev/null || true
+        sleep 1
+    fi
+
+    # Если каталог уже есть — переименовываем как .pre-restore.<ts>, чтобы откатить
+    local rollback_dir=""
+    if [[ -e "$target" ]]; then
+        rollback_dir="${target}.pre-restore.$(date +%s)"
+        mv "$target" "$rollback_dir"
+    fi
+
+    log_step "Распаковка архива..."
+    if ! tar -xzf "$archive" -C "$REPO_DIR" 2>/tmp/crserver-tar.log; then
+        log_error "Ошибка распаковки:"
+        tail -5 /tmp/crserver-tar.log | sed 's/^/    /'
+        rm -f /tmp/crserver-tar.log
+        # Откат
+        if [[ -n "$rollback_dir" ]]; then
+            log_warn "Восстанавливаю предыдущее состояние..."
+            rm -rf "$target" 2>/dev/null || true
+            mv "$rollback_dir" "$target"
+        fi
+        if [[ $was_active -eq 1 ]]; then
+            systemctl start ${SERVICE_NAME} 2>/dev/null || true
+        fi
+        return 1
+    fi
+    rm -f /tmp/crserver-tar.log
+
+    detect_1c_user
+    if [[ -n "$SVC_USER" && -n "$SVC_GROUP" ]]; then
+        chown -R "${SVC_USER}:${SVC_GROUP}" "$target"
+    fi
+
+    log_info "Восстановлено: ${name}"
+    if [[ -n "$rollback_dir" ]]; then
+        echo "  Прежний вариант сохранён: ${rollback_dir}"
+        echo "  Удалите его вручную, если новый бэкап работает корректно."
+    fi
+
+    if [[ $was_active -eq 1 ]]; then
+        systemctl start ${SERVICE_NAME} 2>/dev/null || \
+            log_warn "Служба не стартовала — проверьте journalctl"
+    fi
+}
+
+do_repo_check() {
+    local repo_chosen=""
+    _select_repo_interactive || return
+    local name="$repo_chosen"
+    local dir="${REPO_DIR}/${name}"
+    local issues=0
+
+    echo ""
+    echo "  Проверка хранилища '${name}'"
+    echo "  ─────────────────────────────────────────────"
+
+    detect_1c_user
+    local owner
+    owner=$(stat -c '%U:%G' "$dir" 2>/dev/null || echo "?")
+    if [[ "$owner" == "${SVC_USER}:${SVC_GROUP}" ]]; then
+        log_info "Владелец: ${owner}"
+    else
+        log_warn "Владелец: ${owner} (ожидается ${SVC_USER}:${SVC_GROUP})"
+        issues=$((issues + 1))
+    fi
+
+    local mode
+    mode=$(stat -c '%a' "$dir" 2>/dev/null || echo "?")
+    if [[ "$mode" =~ ^[67][05][05]$ ]]; then
+        log_info "Права: ${mode}"
+    else
+        log_warn "Права: ${mode} (рекомендуется 750/700)"
+    fi
+
+    if repo_looks_initialized "$dir"; then
+        log_info "Структура: похоже на инициализированное хранилище"
+    else
+        log_warn "Структура: пусто/не инициализировано"
+        echo "    Подключитесь конфигуратором и создайте хранилище:"
+        echo "      Конфигурация → Хранилище конфигурации → Создать"
+        issues=$((issues + 1))
+    fi
+
+    # Чужие файлы внутри (часто признак mv от другого пользователя)
+    local foreign
+    foreign=$(find "$dir" ! -user "$SVC_USER" 2>/dev/null | head -3)
+    if [[ -n "$foreign" ]]; then
+        log_warn "Найдены файлы НЕ принадлежащие ${SVC_USER}:"
+        echo "$foreign" | sed 's/^/    /'
+        echo "    Исправить: chown -R ${SVC_USER}:${SVC_GROUP} ${dir}"
+        issues=$((issues + 1))
+    fi
+
+    # Lock-файлы (могут остаться от аварийного завершения)
+    local locks
+    locks=$(find "$dir" -maxdepth 2 -name "*.lck" -o -name "*.lock" 2>/dev/null | head -3)
+    if [[ -n "$locks" ]]; then
+        log_warn "Найдены lock-файлы:"
+        echo "$locks" | sed 's/^/    /'
+        echo "    Если служба остановлена — можно удалить вручную."
+    fi
+
+    echo ""
+    if [[ $issues -eq 0 ]]; then
+        log_info "Проблем не обнаружено"
+    else
+        log_warn "Обнаружено проблем: ${issues}"
+    fi
+}
+
+# ============================================================================
 #  УПРАВЛЕНИЕ ДОСТУПОМ (ФАЙРВОЛ)
 # ============================================================================
 
@@ -2288,6 +2845,10 @@ do_help() {
     echo "    sudo ./crserver-manager.sh versions     список версий"
     echo "    sudo ./crserver-manager.sh path-install добавить в PATH"
     echo "    sudo ./crserver-manager.sh path-remove  удалить из PATH"
+    echo "    sudo ./crserver-manager.sh repo list           список хранилищ"
+    echo "    sudo ./crserver-manager.sh repo create <имя>   создать хранилище"
+    echo "    sudo ./crserver-manager.sh repo delete <имя>   удалить хранилище"
+    echo "    sudo ./crserver-manager.sh repo backup <имя>   бэкап хранилища"
     echo "    sudo ./crserver-manager.sh update       обновить скрипт"
     echo "      └─ update --check    проверить наличие обновлений"
     echo "      └─ update --force    обновить принудительно"
@@ -2357,29 +2918,31 @@ main_menu() {
         echo "  1) Управление версиями"
         echo "  2) Управление службой"
         echo "  3) Настройки сервера"
-        echo "  4) Управление доступом (файрвол)"
-        echo "  5) Бэкап и восстановление"
-        echo "  6) Инструменты"
-        echo "  7) Быстрый вызов (PATH)"
-        echo "  8) Обновление скрипта"
-        echo "  9) Справка"
+        echo "  4) Хранилища конфигураций"
+        echo "  5) Управление доступом (файрвол)"
+        echo "  6) Бэкап и восстановление (всё целиком)"
+        echo "  7) Инструменты"
+        echo "  8) Быстрый вызов (PATH)"
+        echo "  9) Обновление скрипта"
+        echo " 10) Справка"
         echo ""
         echo "  0) Выход"
         echo ""
         read -rp "  Выберите: " choice
 
         case $choice in
-            1) do_version_menu ;;
-            2) do_service_menu ;;
-            3) do_settings_menu ;;
-            4) do_access_menu ;;
-            5) do_backup_menu ;;
-            6) do_tools_menu ;;
-            7) do_path_menu ;;
-            8) do_update_menu ;;
-            9) HELP_INTERACTIVE=1 do_help ;;
-            0) echo ""; exit 0 ;;
-            *) log_warn "Неверный выбор" ;;
+            1)  do_version_menu ;;
+            2)  do_service_menu ;;
+            3)  do_settings_menu ;;
+            4)  do_repo_menu ;;
+            5)  do_access_menu ;;
+            6)  do_backup_menu ;;
+            7)  do_tools_menu ;;
+            8)  do_path_menu ;;
+            9)  do_update_menu ;;
+            10) HELP_INTERACTIVE=1 do_help ;;
+            0)  echo ""; exit 0 ;;
+            *)  log_warn "Неверный выбор" ;;
         esac
     done
 }
@@ -2443,6 +3006,89 @@ case "${1:-}" in
         ;;
     path-install)  do_path_install ;;
     path-remove)   do_path_uninstall ;;
+    repo|repos)
+        case "${2:-list}" in
+            list)
+                local repos=()
+                get_repo_list repos
+                if [[ ${#repos[@]} -eq 0 ]]; then
+                    echo "(хранилищ нет)"
+                else
+                    printf '%s\n' "${repos[@]}"
+                fi
+                ;;
+            create)
+                if [[ -z "${3:-}" ]]; then
+                    log_error "Использование: $0 repo create <имя>"
+                    exit 1
+                fi
+                if ! validate_repo_name "$3"; then
+                    log_error "Недопустимое имя"
+                    exit 1
+                fi
+                detect_1c_user
+                if [[ -z "$SVC_USER" || -z "$SVC_GROUP" ]]; then
+                    log_error "Не определён пользователь usr1cv8"
+                    exit 1
+                fi
+                local d="${REPO_DIR}/$3"
+                if [[ -e "$d" ]]; then
+                    log_error "Уже существует: $d"
+                    exit 1
+                fi
+                mkdir -p "$d"
+                chown "${SVC_USER}:${SVC_GROUP}" "$d"
+                chmod 750 "$d"
+                log_info "Создано: $d"
+                ;;
+            delete)
+                if [[ -z "${3:-}" ]]; then
+                    log_error "Использование: $0 repo delete <имя>"
+                    exit 1
+                fi
+                local d="${REPO_DIR}/$3"
+                if [[ ! -d "$d" ]]; then
+                    log_error "Не найдено: $d"
+                    exit 1
+                fi
+                local was_active=0
+                if systemctl is-active --quiet ${SERVICE_NAME} 2>/dev/null; then
+                    was_active=1
+                    systemctl stop ${SERVICE_NAME} 2>/dev/null || true
+                    sleep 1
+                fi
+                rm -rf "$d" && log_info "Удалено: $3"
+                if [[ $was_active -eq 1 ]]; then
+                    systemctl start ${SERVICE_NAME} 2>/dev/null || true
+                fi
+                ;;
+            backup)
+                if [[ -z "${3:-}" ]]; then
+                    log_error "Использование: $0 repo backup <имя>"
+                    exit 1
+                fi
+                local d="${REPO_DIR}/$3"
+                if [[ ! -d "$d" ]]; then
+                    log_error "Не найдено: $d"
+                    exit 1
+                fi
+                mkdir -p "$BACKUP_DIR"
+                local ts a
+                ts=$(date +%Y%m%d_%H%M%S)
+                a="${BACKUP_DIR}/repo_${3}_${ts}.tar.gz"
+                if tar -czf "$a" -C "$REPO_DIR" "$3" 2>/dev/null; then
+                    log_info "Бэкап: $a"
+                else
+                    log_error "tar не удался"
+                    exit 1
+                fi
+                ;;
+            *)
+                log_error "Использование: $0 repo {list|create <имя>|delete <имя>|backup <имя>}"
+                exit 1
+                ;;
+        esac
+        ;;
     update)
         case "${2:-}" in
             ""|--yes|-y) do_self_update ;;
