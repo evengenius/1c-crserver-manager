@@ -22,6 +22,16 @@ set -euo pipefail
 #    │   └── ...
 # ============================================================================
 
+# --- Версия скрипта ---
+# При выпуске новой версии увеличить и закоммитить в репозиторий.
+# Используется для проверки обновлений (см. do_self_update).
+SCRIPT_VERSION="1.2.0"
+
+# --- Источник обновлений ---
+UPDATE_REPO="evengenius/1c-crserver-manager"
+UPDATE_BRANCH="main"
+UPDATE_URL="https://raw.githubusercontent.com/${UPDATE_REPO}/${UPDATE_BRANCH}/crserver-manager.sh"
+
 # --- Конфигурация ---
 CONFIG_FILE="/etc/1c-crserver/crserver.conf"
 DEFAULT_REPO_DIR="/var/1c/repo"
@@ -64,9 +74,30 @@ check_root() {
 # ============================================================================
 
 load_config() {
+    # Сбрасываем переменные, чтобы повторный вызов с пустым/изменённым конфигом
+    # не сохранял старые значения
+    REPO_DIR=""; REPO_PORT=""; LOG_DIR=""; BACKUP_DIR=""
+
+    # Безопасный парсинг: только KEY="VALUE" из белого списка ключей
     if [[ -f "$CONFIG_FILE" ]]; then
-        source "$CONFIG_FILE"
+        local line key val
+        while IFS= read -r line || [[ -n "$line" ]]; do
+            # Пропуск комментариев/пустых
+            [[ "$line" =~ ^[[:space:]]*# ]] && continue
+            [[ -z "${line//[[:space:]]/}" ]] && continue
+            # Формат KEY="value" или KEY=value (без подстановок)
+            if [[ "$line" =~ ^[[:space:]]*([A-Z_][A-Z0-9_]*)=\"?([^\"]*)\"?[[:space:]]*$ ]]; then
+                key="${BASH_REMATCH[1]}"
+                val="${BASH_REMATCH[2]}"
+                case "$key" in
+                    REPO_DIR|REPO_PORT|LOG_DIR|BACKUP_DIR)
+                        printf -v "$key" '%s' "$val"
+                        ;;
+                esac
+            fi
+        done < "$CONFIG_FILE"
     fi
+
     REPO_DIR="${REPO_DIR:-$DEFAULT_REPO_DIR}"
     REPO_PORT="${REPO_PORT:-$DEFAULT_REPO_PORT}"
     LOG_DIR="${LOG_DIR:-$DEFAULT_LOG_DIR}"
@@ -131,13 +162,13 @@ get_installed_versions() {
 get_available_versions() {
     AVAILABLE_VERSIONS=()
     if [[ -d "$PACKAGES_DIR" ]]; then
+        local dir ver crs_match
         for dir in "$PACKAGES_DIR"/*/; do
             [[ -d "$dir" ]] || continue
-            local ver=$(basename "$dir")
+            ver=$(basename "$dir")
             # Проверяем что внутри есть хотя бы crs-пакет
-            if ls "$dir"/1c-enterprise-*-crs_*.deb &>/dev/null; then
-                AVAILABLE_VERSIONS+=("$ver")
-            fi
+            crs_match=$(find "$dir" -maxdepth 1 -name '1c-enterprise-*-crs_*.deb' ! -name '*-nls*' 2>/dev/null | head -1)
+            [[ -n "$crs_match" ]] && AVAILABLE_VERSIONS+=("$ver")
         done
     fi
 }
@@ -146,14 +177,15 @@ get_available_versions() {
 validate_version_packages() {
     local ver="$1"
     local dir="${PACKAGES_DIR}/${ver}"
-    local ok=1
 
-    [[ -z "$(find "$dir" -maxdepth 1 -name '1c-enterprise-*-common_*.deb' ! -name '*-nls*' 2>/dev/null | head -1)" ]] && ok=0
-    [[ -z "$(find "$dir" -maxdepth 1 -name '1c-enterprise-*-server_*.deb' ! -name '*-nls*' 2>/dev/null | head -1)" ]] && ok=0
-    [[ -z "$(find "$dir" -maxdepth 1 -name '1c-enterprise-*-ws_*.deb'     ! -name '*-nls*' 2>/dev/null | head -1)" ]] && ok=0
-    [[ -z "$(find "$dir" -maxdepth 1 -name '1c-enterprise-*-crs_*.deb'    ! -name '*-nls*' 2>/dev/null | head -1)" ]] && ok=0
+    [[ -d "$dir" ]] || return 1
 
-    return $(( 1 - ok ))
+    local kind found
+    for kind in common server ws crs; do
+        found=$(find "$dir" -maxdepth 1 -name "1c-enterprise-*-${kind}_*.deb" ! -name '*-nls*' 2>/dev/null | head -1)
+        [[ -n "$found" ]] || return 1
+    done
+    return 0
 }
 
 # Определяем пользователя и группу 1С
@@ -163,6 +195,16 @@ detect_1c_user() {
     if id "$SVC_USER" &>/dev/null; then
         SVC_GROUP=$(id -gn "$SVC_USER")
     fi
+}
+
+# Возвращает основной IP-адрес сервера (или "127.0.0.1" если не удалось)
+get_primary_ip() {
+    local ip
+    ip=$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src"){print $(i+1); exit}}')
+    if [[ -z "$ip" ]]; then
+        ip=$(hostname -I 2>/dev/null | awk '{print $1}')
+    fi
+    echo "${ip:-127.0.0.1}"
 }
 
 # ============================================================================
@@ -328,10 +370,16 @@ install_version() {
         return 1
     fi
 
-    local COMMON_PKG=$(find "$pkg_dir" -maxdepth 1 -name "1c-enterprise-*-common_*.deb" ! -name "*-nls*" | head -1)
-    local SERVER_PKG=$(find "$pkg_dir" -maxdepth 1 -name "1c-enterprise-*-server_*.deb" ! -name "*-nls*" | head -1)
-    local WS_PKG=$(find "$pkg_dir" -maxdepth 1 -name "1c-enterprise-*-ws_*.deb" ! -name "*-nls*" | head -1)
-    local CRS_PKG=$(find "$pkg_dir" -maxdepth 1 -name "1c-enterprise-*-crs_*.deb" ! -name "*-nls*" | head -1)
+    local COMMON_PKG SERVER_PKG WS_PKG CRS_PKG
+    COMMON_PKG=$(find "$pkg_dir" -maxdepth 1 -name "1c-enterprise-*-common_*.deb" ! -name "*-nls*" 2>/dev/null | head -1)
+    SERVER_PKG=$(find "$pkg_dir" -maxdepth 1 -name "1c-enterprise-*-server_*.deb" ! -name "*-nls*" 2>/dev/null | head -1)
+    WS_PKG=$(find "$pkg_dir" -maxdepth 1 -name "1c-enterprise-*-ws_*.deb"         ! -name "*-nls*" 2>/dev/null | head -1)
+    CRS_PKG=$(find "$pkg_dir" -maxdepth 1 -name "1c-enterprise-*-crs_*.deb"       ! -name "*-nls*" 2>/dev/null | head -1)
+
+    if [[ -z "$COMMON_PKG" || -z "$SERVER_PKG" || -z "$WS_PKG" || -z "$CRS_PKG" ]]; then
+        log_error "Не удалось найти один из пакетов в ${pkg_dir}/"
+        return 1
+    fi
 
     echo "  Пакеты:"
     echo "    common: $(basename "$COMMON_PKG")"
@@ -340,11 +388,24 @@ install_version() {
     echo "    crs:    $(basename "$CRS_PKG")"
     echo ""
 
-    dpkg -i "$COMMON_PKG" 2>&1 | tail -1 || true
-    dpkg -i "$SERVER_PKG" 2>&1 | tail -1 || true
-    dpkg -i "$WS_PKG"     2>&1 | tail -1 || true
-    dpkg -i "$CRS_PKG"    2>&1 | tail -1 || true
-    apt-get install -f -y -qq > /dev/null 2>&1 || true
+    local pkg dpkg_failed=0
+    for pkg in "$COMMON_PKG" "$SERVER_PKG" "$WS_PKG" "$CRS_PKG"; do
+        if ! dpkg -i "$pkg" >/tmp/crserver-dpkg.log 2>&1; then
+            dpkg_failed=1
+            log_warn "dpkg -i $(basename "$pkg") завершился с ошибкой:"
+            tail -5 /tmp/crserver-dpkg.log | sed 's/^/    /'
+        fi
+    done
+    rm -f /tmp/crserver-dpkg.log
+
+    if ! apt-get install -f -y -qq >/dev/null 2>&1; then
+        log_warn "apt-get install -f не смог автоматически починить зависимости"
+        dpkg_failed=1
+    fi
+
+    if [[ $dpkg_failed -eq 1 ]]; then
+        log_warn "Установка пакетов прошла с ошибками, проверьте вывод выше"
+    fi
 
     local crserver_bin="/opt/1cv8/x86_64/${ver}/crserver"
     if [[ ! -f "$crserver_bin" ]]; then
@@ -400,7 +461,9 @@ do_uninstall_version() {
             echo ""
             log_warn "Версия ${selected} сейчас активна! Служба будет остановлена."
             read -rp "  Продолжить? (y/N): " answer
-            [[ ! "$answer" =~ ^[Yy]$ ]] && return
+            if [[ ! "$answer" =~ ^[Yy]$ ]]; then
+                return
+            fi
             systemctl stop ${SERVICE_NAME} 2>/dev/null || true
         fi
 
@@ -430,14 +493,26 @@ uninstall_version() {
         log_info "Версия ${ver} удалена"
     fi
 
-    # Если удалили активную — чистим службу
+    # Если удалили активную — нужно либо переключить на другую, либо снести службу
+    local was_active=0
+    [[ "$ver" == "$ACTIVE_VERSION" ]] && was_active=1
+
     detect_active_version
-    if [[ "$ACTIVE_VERSION" == "$ver" || -z "$ACTIVE_VERSION" ]]; then
-        get_installed_versions
+    get_installed_versions
+
+    if [[ $was_active -eq 1 ]]; then
         if [[ ${#INSTALLED_VERSIONS[@]} -gt 0 ]]; then
-            log_warn "Активная версия удалена. Переключитесь на другую через меню."
+            # Автоматически переключаемся на первую оставшуюся версию,
+            # чтобы systemd-юнит не указывал на удалённый бинарник
+            local fallback="${INSTALLED_VERSIONS[0]}"
+            log_warn "Активная версия удалена — переключаюсь на ${fallback}"
+            ACTIVE_VERSION="$fallback"
+            ACTIVE_CRSERVER_BIN="/opt/1cv8/x86_64/${fallback}/crserver"
+            regenerate_service
+            systemctl restart ${SERVICE_NAME} 2>/dev/null || \
+                log_warn "Служба не запустилась автоматически — проверьте journalctl -u ${SERVICE_NAME}"
         else
-            # Удаляем службу если версий не осталось
+            # Удаляем службу — версий не осталось
             if [[ -f /etc/systemd/system/${SERVICE_NAME}.service ]]; then
                 systemctl disable ${SERVICE_NAME} 2>/dev/null || true
                 rm -f /etc/systemd/system/${SERVICE_NAME}.service
@@ -508,25 +583,67 @@ switch_to_version() {
         log_error "crserver не найден: $new_bin"
         return 1
     fi
+    if [[ ! -x "$new_bin" ]]; then
+        log_warn "Файл $new_bin не исполняемый, ставлю +x"
+        chmod +x "$new_bin" 2>/dev/null || true
+    fi
 
     log_step "Переключение на версию ${ver}..."
 
-    # Останавливаем текущую службу
-    systemctl stop ${SERVICE_NAME} 2>/dev/null || true
+    # 1) Останавливаем текущую службу с явным ожиданием полного завершения
+    if systemctl is-active --quiet ${SERVICE_NAME} 2>/dev/null; then
+        log_step "Остановка текущей службы..."
+        if ! systemctl stop ${SERVICE_NAME}; then
+            log_warn "systemctl stop вернул ошибку, продолжаю"
+        fi
+        # Ждём, пока порт освободится (до 15 секунд)
+        local i
+        for i in {1..15}; do
+            if ! ss -tln 2>/dev/null | grep -q ":${REPO_PORT}\b"; then
+                break
+            fi
+            sleep 1
+        done
+        if ss -tln 2>/dev/null | grep -q ":${REPO_PORT}\b"; then
+            log_warn "Порт ${REPO_PORT} всё ещё занят — попытка форсированного завершения"
+            pkill -TERM -f "crserver.*-port[ =]*${REPO_PORT}" 2>/dev/null || true
+            sleep 2
+            pkill -KILL -f "crserver.*-port[ =]*${REPO_PORT}" 2>/dev/null || true
+            sleep 1
+        fi
+    fi
 
-    # Пересоздаём службу с новой версией
+    # 2) Пересоздаём systemd-юнит с новой версией
     ACTIVE_VERSION="$ver"
     ACTIVE_CRSERVER_BIN="$new_bin"
-    regenerate_service
+    if ! regenerate_service; then
+        log_error "Не удалось пересоздать systemd-службу"
+        return 1
+    fi
 
-    # Запускаем
-    systemctl start ${SERVICE_NAME}
+    # 3) Запускаем (без падения скрипта при ошибке)
+    log_step "Запуск службы..."
+    local start_rc=0
+    systemctl start ${SERVICE_NAME} || start_rc=$?
+
+    # Дать systemd шанс stабилизироваться
     sleep 2
 
     if systemctl is-active --quiet ${SERVICE_NAME}; then
         log_info "Переключено на версию ${ver} — служба запущена"
+        if ss -tln 2>/dev/null | grep -q ":${REPO_PORT}\b"; then
+            log_info "Порт ${REPO_PORT} слушается"
+        else
+            log_warn "Служба активна, но порт ${REPO_PORT} ещё не слушается (подождите несколько секунд)"
+        fi
+        return 0
     else
-        log_error "Служба не запустилась. Проверьте: journalctl -u ${SERVICE_NAME} -n 50"
+        log_error "Служба не запустилась (systemctl start exit=${start_rc})"
+        echo "  Последние строки журнала:"
+        journalctl -u ${SERVICE_NAME} -n 20 --no-pager 2>/dev/null | sed 's/^/    /' || true
+        echo ""
+        echo "  Полный лог: journalctl -u ${SERVICE_NAME} -n 100"
+        return 1
     fi
 }
 
@@ -562,11 +679,12 @@ do_import_packages() {
 
     # Ищем .deb пакеты crs в источнике
     local found_versions=()
+    local crs_file ver fv dup
     while IFS= read -r crs_file; do
-        local ver=$(basename "$crs_file" | grep -oP '8\.3\.\d+\.\d+' || true)
+        ver=$(basename "$crs_file" | grep -oP '8\.3\.\d+\.\d+' || true)
         if [[ -n "$ver" ]]; then
             # Проверяем что нет дубликатов
-            local dup=0
+            dup=0
             for fv in "${found_versions[@]+"${found_versions[@]}"}"; do
                 [[ "$fv" == "$ver" ]] && dup=1
             done
@@ -580,18 +698,30 @@ do_import_packages() {
         return
     fi
 
+    local dest deb count failed
     for ver in "${found_versions[@]}"; do
-        local dest="${PACKAGES_DIR}/${ver}"
+        dest="${PACKAGES_DIR}/${ver}"
         mkdir -p "$dest"
 
-        local count=0
+        count=0
+        failed=0
         for deb in "$source_dir"/1c-enterprise-${ver}-*.deb; do
             [[ -f "$deb" ]] || continue
-            cp -v "$deb" "$dest/" 2>/dev/null
-            count=$((count + 1))
+            # Пропускаем NLS-пакеты (валидатор их игнорирует)
+            [[ "$(basename "$deb")" == *-nls* ]] && continue
+            if cp "$deb" "$dest/"; then
+                count=$((count + 1))
+            else
+                failed=$((failed + 1))
+                log_warn "  не удалось скопировать: $(basename "$deb")"
+            fi
         done
 
-        log_info "Версия ${ver}: скопировано ${count} пакетов → ${dest}/"
+        if [[ $failed -eq 0 ]]; then
+            log_info "Версия ${ver}: скопировано ${count} пакетов → ${dest}/"
+        else
+            log_warn "Версия ${ver}: скопировано ${count}, ошибок ${failed} → ${dest}/"
+        fi
     done
 
     echo ""
@@ -702,7 +832,10 @@ do_full_install() {
     ACTIVE_VERSION="$target_ver"
     ACTIVE_CRSERVER_BIN="/opt/1cv8/x86_64/${target_ver}/crserver"
     log_step "Создание systemd-службы..."
-    regenerate_service
+    if ! regenerate_service; then
+        log_error "Не удалось создать systemd-службу"
+        return 1
+    fi
     log_info "Служба создана"
 
     # --- 6. Файрвол ---
@@ -712,13 +845,16 @@ do_full_install() {
 
     # --- 7. Запуск ---
     log_step "Запуск сервера хранилища..."
-    systemctl start ${SERVICE_NAME}
+    local start_rc=0
+    systemctl start ${SERVICE_NAME} || start_rc=$?
     sleep 2
 
     if systemctl is-active --quiet ${SERVICE_NAME}; then
         log_info "Сервер хранилища ЗАПУЩЕН"
     else
-        log_error "Не удалось запустить. Проверьте: journalctl -u ${SERVICE_NAME} -n 50"
+        log_error "Не удалось запустить (systemctl start exit=${start_rc})"
+        echo "  Последние строки журнала:"
+        journalctl -u ${SERVICE_NAME} -n 20 --no-pager 2>/dev/null | sed 's/^/    /' || true
         return 1
     fi
 
@@ -733,7 +869,7 @@ do_full_install() {
     echo -e "${BOLD}══════════════════════════════════════════════════${NC}"
     echo -e "${GREEN}  УСТАНОВКА ЗАВЕРШЕНА${NC}"
     echo -e "${BOLD}══════════════════════════════════════════════════${NC}"
-    IP_ADDR=$(hostname -I | awk '{print $1}')
+    IP_ADDR=$(get_primary_ip)
     echo ""
     echo "  Версия:   ${target_ver}"
     echo "  Адрес:    tcp://${IP_ADDR}:${REPO_PORT}/<имя_хранилища>"
@@ -842,9 +978,29 @@ do_service_menu() {
         read -rp "  Выберите: " choice
 
         case $choice in
-            1) systemctl start ${SERVICE_NAME} && log_info "Запущен" || log_error "Ошибка запуска"; sleep 1 ;;
-            2) systemctl stop ${SERVICE_NAME} && log_info "Остановлен" || log_error "Ошибка остановки" ;;
-            3) systemctl restart ${SERVICE_NAME} && log_info "Перезапущен" || log_error "Ошибка"; sleep 1 ;;
+            1)
+                if systemctl start ${SERVICE_NAME}; then
+                    log_info "Запущен"
+                else
+                    log_error "Ошибка запуска (journalctl -u ${SERVICE_NAME} -n 20)"
+                fi
+                sleep 1
+                ;;
+            2)
+                if systemctl stop ${SERVICE_NAME}; then
+                    log_info "Остановлен"
+                else
+                    log_error "Ошибка остановки"
+                fi
+                ;;
+            3)
+                if systemctl restart ${SERVICE_NAME}; then
+                    log_info "Перезапущен"
+                else
+                    log_error "Ошибка перезапуска (journalctl -u ${SERVICE_NAME} -n 20)"
+                fi
+                sleep 1
+                ;;
             4)
                 echo ""
                 systemctl status ${SERVICE_NAME} --no-pager 2>/dev/null || log_warn "Служба не найдена"
@@ -948,16 +1104,43 @@ do_settings_menu() {
 }
 
 regenerate_service() {
-    detect_active_version
+    # detect_active_version вызывается только если ACTIVE_VERSION/_BIN ещё не заданы,
+    # иначе мы потеряем ручное переключение, выполненное вызывающим кодом.
+    if [[ -z "${ACTIVE_VERSION:-}" || -z "${ACTIVE_CRSERVER_BIN:-}" ]]; then
+        detect_active_version
+    fi
     detect_1c_user
 
-    local bin="${ACTIVE_CRSERVER_BIN}"
-    local ver="${ACTIVE_VERSION}"
+    local bin="${ACTIVE_CRSERVER_BIN:-}"
+    local ver="${ACTIVE_VERSION:-}"
 
     if [[ -z "$bin" || ! -f "$bin" ]]; then
         log_error "crserver не найден. Сначала установите версию."
         return 1
     fi
+
+    if [[ -z "$SVC_USER" || -z "$SVC_GROUP" ]]; then
+        log_error "Не определён системный пользователь 1С (usr1cv8)"
+        return 1
+    fi
+
+    # Валидация путей: должны быть абсолютными, без переносов строк
+    local p
+    for p in "$REPO_DIR" "$LOG_DIR"; do
+        if [[ -z "$p" || "$p" != /* || "$p" == *$'\n'* ]]; then
+            log_error "Некорректный путь в конфигурации: '${p}' (ожидается абсолютный путь)"
+            return 1
+        fi
+    done
+
+    if ! [[ "$REPO_PORT" =~ ^[0-9]+$ ]] || (( REPO_PORT < 1 || REPO_PORT > 65535 )); then
+        log_error "Некорректный порт: '${REPO_PORT}'"
+        return 1
+    fi
+
+    # Гарантируем существование каталогов, на которые ссылается ReadWritePaths,
+    # иначе systemd откажется стартовать юнит ("Failed to set up mount namespacing")
+    mkdir -p "$REPO_DIR" "$LOG_DIR" 2>/dev/null || true
 
     cat > /etc/systemd/system/${SERVICE_NAME}.service << EOF
 [Unit]
@@ -990,17 +1173,36 @@ PrivateTmp=yes
 WantedBy=multi-user.target
 EOF
 
-    systemctl daemon-reload
-    systemctl enable ${SERVICE_NAME} > /dev/null 2>&1
+    if ! systemctl daemon-reload; then
+        log_error "systemctl daemon-reload завершился с ошибкой"
+        return 1
+    fi
+    systemctl enable ${SERVICE_NAME} > /dev/null 2>&1 || \
+        log_warn "systemctl enable вернул ошибку (продолжаю)"
+    return 0
 }
 
 # ============================================================================
 #  УПРАВЛЕНИЕ ДОСТУПОМ (ФАЙРВОЛ)
 # ============================================================================
 
+# ──────────────────────────────────────────────────────────────────────────
+# МОДЕЛЬ ЦЕПОЧКИ:
+#   1. ACCEPT loopback (всегда)
+#   2..N-1. ACCEPT для разрешённых IP/подсетей (добавляются пользователем)
+#   N.  ПОЛИСИ-ПРАВИЛО (последнее):
+#         ACCEPT (открытый режим)  — порт открыт всем
+#         DROP   (whitelist режим) — пускаем только разрешённых
+#
+# Все вставки IP выполняются ПЕРЕД полиси-правилом.
+# Подсчёт правил для индекса вставки берётся через -S (reliable) и пропускает
+# заголовочные строки.
+# ──────────────────────────────────────────────────────────────────────────
+
 setup_firewall_chain() {
     iptables -N "$IPTABLES_CHAIN" 2>/dev/null || iptables -F "$IPTABLES_CHAIN"
     iptables -A "$IPTABLES_CHAIN" -s 127.0.0.1 -j ACCEPT
+    # По умолчанию — открытый режим: финальное правило ACCEPT
     iptables -A "$IPTABLES_CHAIN" -j ACCEPT
     iptables -C INPUT -p tcp --dport "$REPO_PORT" -j "$IPTABLES_CHAIN" 2>/dev/null || \
         iptables -A INPUT -p tcp --dport "$REPO_PORT" -j "$IPTABLES_CHAIN"
@@ -1029,6 +1231,40 @@ save_iptables() {
     fi
 }
 
+# Возвращает количество правил в цепочке (по выводу -S, без -N строки)
+chain_rule_count() {
+    iptables -S "$IPTABLES_CHAIN" 2>/dev/null | grep -c '^-A ' || true
+}
+
+# Возвращает текущий полиси-режим: "whitelist" | "open" | "unknown"
+current_policy_mode() {
+    local last
+    last=$(iptables -S "$IPTABLES_CHAIN" 2>/dev/null | grep '^-A ' | tail -1 || true)
+    if [[ "$last" == *"-j DROP"* ]]; then
+        echo "whitelist"
+    elif [[ "$last" == "-A $IPTABLES_CHAIN -j ACCEPT" ]]; then
+        echo "open"
+    else
+        echo "unknown"
+    fi
+}
+
+# Заменяет финальное полиси-правило (DROP <-> ACCEPT-all)
+set_policy_mode() {
+    local mode="$1"  # whitelist | open
+    ensure_firewall_chain
+
+    # Удаляем все возможные финальные полиси-правила
+    iptables -D "$IPTABLES_CHAIN" -j ACCEPT 2>/dev/null || true
+    iptables -D "$IPTABLES_CHAIN" -j DROP   2>/dev/null || true
+
+    case "$mode" in
+        whitelist) iptables -A "$IPTABLES_CHAIN" -j DROP ;;
+        open)      iptables -A "$IPTABLES_CHAIN" -j ACCEPT ;;
+    esac
+    save_iptables
+}
+
 do_access_menu() {
     while true; do
         echo ""
@@ -1037,24 +1273,34 @@ do_access_menu() {
         echo -e "${BOLD}══════════════════════════════════════════════════${NC}"
         echo ""
 
-        echo "  Текущие правила для порта ${REPO_PORT}:"
+        local mode
+        mode=$(current_policy_mode)
+        echo -n "  Режим: "
+        case "$mode" in
+            whitelist) echo -e "${YELLOW}БЕЛЫЙ СПИСОК${NC} (доступ только для разрешённых IP)" ;;
+            open)      echo -e "${GREEN}ОТКРЫТЫЙ${NC} (порт ${REPO_PORT} доступен всем)" ;;
+            *)         echo -e "${RED}не настроен${NC} (создайте через установку)" ;;
+        esac
+
+        echo ""
+        echo "  Правила для порта ${REPO_PORT}:"
         echo "  ─────────────────────────────────────────────"
 
-        if iptables -L "$IPTABLES_CHAIN" -n 2>/dev/null | grep -q "ACCEPT\|DROP"; then
-            local idx=0
+        if iptables -L "$IPTABLES_CHAIN" -n --line-numbers 2>/dev/null | grep -qE '^[0-9]+ +(ACCEPT|DROP)'; then
+            local line num action src color desc
             while IFS= read -r line; do
-                if [[ "$line" == *"ACCEPT"* || "$line" == *"DROP"* ]]; then
-                    idx=$((idx + 1))
-                    local src=$(echo "$line" | awk '{print $4}')
-                    local action=$(echo "$line" | awk '{print $1}')
-                    [[ "$src" == "0.0.0.0/0" ]] && src="ВСЕ"
-                    local color="${GREEN}"
-                    [[ "$action" == "DROP" ]] && color="${RED}"
-                    echo -e "    ${idx}) ${color}${action}${NC}  ←  ${src}"
-                fi
-            done <<< "$(iptables -L "$IPTABLES_CHAIN" -n 2>/dev/null)"
+                # колонки: num target prot opt source destination ...
+                num=$(awk '{print $1}'   <<< "$line")
+                action=$(awk '{print $2}' <<< "$line")
+                src=$(awk '{print $5}'    <<< "$line")
+                color="${GREEN}"
+                [[ "$action" == "DROP" ]] && color="${RED}"
+                desc="$src"
+                [[ "$src" == "0.0.0.0/0" ]] && desc="ВСЕ"
+                echo -e "    [${num}] ${color}${action}${NC}  ←  ${desc}"
+            done < <(iptables -L "$IPTABLES_CHAIN" -n --line-numbers 2>/dev/null | grep -E '^[0-9]+ +(ACCEPT|DROP)')
         else
-            echo "    (цепочка не создана — порт открыт по умолчанию)"
+            echo "    (цепочка не создана — выполните установку)"
         fi
 
         echo ""
@@ -1062,7 +1308,7 @@ do_access_menu() {
         echo "  2) Добавить разрешённую подсеть"
         echo "  3) Включить режим белого списка (заблокировать всех остальных)"
         echo "  4) Открыть порт для всех (снять ограничения)"
-        echo "  5) Удалить правило по номеру"
+        echo "  5) Удалить правило по номеру (см. [N] выше)"
         echo "  6) Показать мой внешний IP (curl ifconfig.me)"
         echo ""
         echo "  0) ← Назад"
@@ -1098,20 +1344,21 @@ do_access_menu() {
                 fi
                 ;;
             4)
-                ensure_firewall_chain
-                iptables -F "$IPTABLES_CHAIN" 2>/dev/null || true
-                iptables -A "$IPTABLES_CHAIN" -s 127.0.0.1 -j ACCEPT
-                iptables -A "$IPTABLES_CHAIN" -j ACCEPT
-                save_iptables
+                set_policy_mode open
                 log_info "Порт ${REPO_PORT} открыт для всех"
                 ;;
             5)
                 read -rp "  Номер правила для удаления: " rule_num
                 if [[ "$rule_num" =~ ^[0-9]+$ ]]; then
                     ensure_firewall_chain
-                    iptables -D "$IPTABLES_CHAIN" "$rule_num" 2>/dev/null && \
-                        { save_iptables; log_info "Правило #${rule_num} удалено"; } || \
+                    if iptables -D "$IPTABLES_CHAIN" "$rule_num" 2>/dev/null; then
+                        save_iptables
+                        log_info "Правило #${rule_num} удалено"
+                    else
                         log_error "Не удалось удалить правило #${rule_num}"
+                    fi
+                else
+                    log_error "Номер должен быть числом"
                 fi
                 ;;
             6)
@@ -1144,11 +1391,11 @@ add_allowed_ip() {
         return
     fi
 
-    local num_rules
-    num_rules=$(iptables -L "$IPTABLES_CHAIN" --line-numbers -n 2>/dev/null | tail -n +3 | wc -l)
-
-    if [[ $num_rules -gt 0 ]]; then
-        iptables -I "$IPTABLES_CHAIN" "$num_rules" -s "$ip" -j ACCEPT
+    # Вставляем перед последним правилом (полиси-правилом).
+    local total
+    total=$(chain_rule_count)
+    if [[ $total -ge 1 ]]; then
+        iptables -I "$IPTABLES_CHAIN" "$total" -s "$ip" -j ACCEPT
     else
         iptables -A "$IPTABLES_CHAIN" -s "$ip" -j ACCEPT
     fi
@@ -1159,17 +1406,12 @@ add_allowed_ip() {
 enable_whitelist_mode() {
     ensure_firewall_chain
 
-    local has_drop
-    has_drop=$(iptables -L "$IPTABLES_CHAIN" -n 2>/dev/null | grep -c "DROP.*0\.0\.0\.0/0" || true)
-
-    if [[ "$has_drop" -gt 0 ]]; then
+    if [[ "$(current_policy_mode)" == "whitelist" ]]; then
         log_warn "Режим белого списка уже включён"
         return
     fi
 
-    while iptables -D "$IPTABLES_CHAIN" -s 0.0.0.0/0 -j ACCEPT 2>/dev/null; do :; done
-    iptables -A "$IPTABLES_CHAIN" -j DROP
-    save_iptables
+    set_policy_mode whitelist
 }
 
 # ============================================================================
@@ -1184,14 +1426,22 @@ do_backup_menu() {
         echo -e "${BOLD}══════════════════════════════════════════════════${NC}"
         echo ""
 
-        if [[ -d "$BACKUP_DIR" ]] && ls "$BACKUP_DIR"/*.tar.gz &>/dev/null; then
+        local backup_files=()
+        if [[ -d "$BACKUP_DIR" ]]; then
+            local f
+            for f in "$BACKUP_DIR"/*.tar.gz; do
+                [[ -f "$f" ]] && backup_files+=("$f")
+            done
+        fi
+
+        if [[ ${#backup_files[@]} -gt 0 ]]; then
             echo "  Существующие бэкапы:"
             echo "  ─────────────────────────────────────────────"
-            local idx=0
-            for f in "$BACKUP_DIR"/*.tar.gz; do
+            local idx=0 size
+            for f in "${backup_files[@]}"; do
                 idx=$((idx + 1))
-                local size=$(du -sh "$f" | awk '{print $1}')
-                echo "    ${idx}) $(basename "$f")  [${size}]"
+                size=$(du -sh "$f" 2>/dev/null | awk '{print $1}')
+                echo "    ${idx}) $(basename "$f")  [${size:-?}]"
             done
             echo ""
         else
@@ -1202,7 +1452,8 @@ do_backup_menu() {
         echo "  1) Создать бэкап хранилищ"
         echo "  2) Восстановить из бэкапа"
         echo "  3) Настроить автоматический бэкап (cron)"
-        echo "  4) Удалить старые бэкапы"
+        echo "  4) Удалить старые бэкапы (по возрасту)"
+        echo "  5) Удалить бэкап по номеру"
         echo ""
         echo "  0) ← Назад"
         echo ""
@@ -1215,8 +1466,37 @@ do_backup_menu() {
             4)
                 read -rp "  Удалить бэкапы старше N дней [30]: " days
                 days="${days:-30}"
-                find "$BACKUP_DIR" -name "*.tar.gz" -mtime +"$days" -delete 2>/dev/null
-                log_info "Бэкапы старше ${days} дней удалены"
+                if ! [[ "$days" =~ ^[0-9]+$ ]] || (( days < 1 )); then
+                    log_error "Срок должен быть положительным числом"
+                else
+                    if [[ -d "$BACKUP_DIR" ]]; then
+                        find "$BACKUP_DIR" -maxdepth 1 -name "crserver_backup_*.tar.gz" -mtime +"$days" -delete 2>/dev/null
+                        log_info "Бэкапы старше ${days} дней удалены"
+                    else
+                        log_warn "Каталог бэкапов не существует"
+                    fi
+                fi
+                ;;
+            5)
+                if [[ ${#backup_files[@]} -eq 0 ]]; then
+                    log_warn "Нет бэкапов для удаления"
+                else
+                    read -rp "  Номер бэкапа для удаления (или 0 для отмены): " num
+                    if [[ "$num" == "0" || -z "$num" ]]; then
+                        :
+                    elif [[ "$num" =~ ^[0-9]+$ ]] && (( num >= 1 && num <= ${#backup_files[@]} )); then
+                        local target="${backup_files[$((num - 1))]}"
+                        echo ""
+                        echo "  Удалить: $(basename "$target")?"
+                        read -rp "  (y/N): " ans
+                        if [[ "$ans" =~ ^[Yy]$ ]]; then
+                            rm -f "$target"
+                            log_info "Удалён: $(basename "$target")"
+                        fi
+                    else
+                        log_error "Неверный номер"
+                    fi
+                fi
                 ;;
             0) return ;;
             *) log_warn "Неверный выбор" ;;
@@ -1225,17 +1505,30 @@ do_backup_menu() {
 }
 
 do_backup() {
+    if [[ ! -d "$REPO_DIR" ]]; then
+        log_error "Каталог хранилищ не существует: ${REPO_DIR}"
+        return 1
+    fi
+
     mkdir -p "$BACKUP_DIR"
-    local timestamp=$(date +%Y%m%d_%H%M%S)
-    local backup_file="${BACKUP_DIR}/crserver_backup_${timestamp}.tar.gz"
+    local timestamp backup_file
+    timestamp=$(date +%Y%m%d_%H%M%S)
+    backup_file="${BACKUP_DIR}/crserver_backup_${timestamp}.tar.gz"
 
     log_step "Создание бэкапа хранилищ..."
-    tar -czf "$backup_file" \
-        -C "$(dirname "$REPO_DIR")" "$(basename "$REPO_DIR")" \
-        --ignore-failed-read 2>/dev/null || true
+    if ! tar -czf "$backup_file" \
+            -C "$(dirname "$REPO_DIR")" "$(basename "$REPO_DIR")" \
+            --ignore-failed-read 2>/tmp/crserver-tar.log; then
+        log_error "Создание бэкапа не удалось:"
+        tail -5 /tmp/crserver-tar.log | sed 's/^/    /'
+        rm -f /tmp/crserver-tar.log "$backup_file"
+        return 1
+    fi
+    rm -f /tmp/crserver-tar.log
 
-    local size=$(du -sh "$backup_file" | awk '{print $1}')
-    log_info "Бэкап создан: $backup_file [$size]"
+    local size
+    size=$(du -sh "$backup_file" 2>/dev/null | awk '{print $1}')
+    log_info "Бэкап создан: ${backup_file} [${size:-?}]"
 }
 
 do_restore() {
@@ -1263,11 +1556,34 @@ do_restore() {
         log_warn "Это перезапишет текущие хранилища в ${REPO_DIR}!"
         read -rp "  Продолжить? (y/N): " answer
         if [[ "$answer" =~ ^[Yy]$ ]]; then
+            local was_active=0
+            if systemctl is-active --quiet ${SERVICE_NAME} 2>/dev/null; then
+                was_active=1
+            fi
             systemctl stop ${SERVICE_NAME} 2>/dev/null || true
-            tar -xzf "$selected" -C "$(dirname "$REPO_DIR")" 2>/dev/null
+
+            if ! tar -xzf "$selected" -C "$(dirname "$REPO_DIR")" 2>/tmp/crserver-tar.log; then
+                log_error "Ошибка распаковки бэкапа:"
+                tail -5 /tmp/crserver-tar.log | sed 's/^/    /'
+                rm -f /tmp/crserver-tar.log
+                # Пытаемся вернуть службу в исходное состояние
+                if [[ $was_active -eq 1 ]]; then
+                    systemctl start ${SERVICE_NAME} 2>/dev/null || true
+                fi
+                return 1
+            fi
+            rm -f /tmp/crserver-tar.log
+
             detect_1c_user
-            chown -R "${SVC_USER}:${SVC_GROUP}" "$REPO_DIR"
-            systemctl start ${SERVICE_NAME} 2>/dev/null || true
+            if [[ -n "$SVC_USER" && -n "$SVC_GROUP" ]]; then
+                chown -R "${SVC_USER}:${SVC_GROUP}" "$REPO_DIR"
+            fi
+
+            if [[ $was_active -eq 1 ]]; then
+                if ! systemctl start ${SERVICE_NAME} 2>/dev/null; then
+                    log_error "Служба не запустилась после восстановления — journalctl -u ${SERVICE_NAME}"
+                fi
+            fi
             log_info "Восстановлено из: $(basename "$selected")"
         fi
     else
@@ -1277,26 +1593,42 @@ do_restore() {
 
 do_setup_cron_backup() {
     local cron_script="/usr/local/bin/crserver-backup.sh"
+    local keep_days=30
+
+    read -rp "  Хранить N дней [30]: " input_days
+    if [[ -n "$input_days" ]]; then
+        if [[ "$input_days" =~ ^[0-9]+$ ]] && (( input_days >= 1 )); then
+            keep_days="$input_days"
+        else
+            log_error "Срок должен быть положительным числом"
+            return
+        fi
+    fi
 
     cat > "$cron_script" << EOFCRON
 #!/bin/bash
+set -u
 BACKUP_DIR="${BACKUP_DIR}"
 REPO_DIR="${REPO_DIR}"
-KEEP_DAYS=30
+KEEP_DAYS=${keep_days}
 
 mkdir -p "\$BACKUP_DIR"
 timestamp=\$(date +%Y%m%d_%H%M%S)
-tar -czf "\${BACKUP_DIR}/crserver_backup_\${timestamp}.tar.gz" \\
-    -C "\$(dirname "\$REPO_DIR")" "\$(basename "\$REPO_DIR")" \\
-    --ignore-failed-read 2>/dev/null
-find "\$BACKUP_DIR" -name "*.tar.gz" -mtime +\${KEEP_DAYS} -delete 2>/dev/null
+log_file="\${BACKUP_DIR}/.last-backup.log"
+if ! tar -czf "\${BACKUP_DIR}/crserver_backup_\${timestamp}.tar.gz" \\
+        -C "\$(dirname "\$REPO_DIR")" "\$(basename "\$REPO_DIR")" \\
+        --ignore-failed-read 2>"\$log_file"; then
+    logger -t crserver-backup "FAILED at \${timestamp}, see \${log_file}"
+    exit 1
+fi
+find "\$BACKUP_DIR" -maxdepth 1 -name "crserver_backup_*.tar.gz" -mtime +\${KEEP_DAYS} -delete 2>/dev/null
 EOFCRON
 
     chmod +x "$cron_script"
     local cron_line="0 3 * * * ${cron_script}"
-    (crontab -l 2>/dev/null | grep -v "$cron_script"; echo "$cron_line") | crontab -
+    (crontab -l 2>/dev/null | grep -F -v "$cron_script"; echo "$cron_line") | crontab -
 
-    log_info "Автобэкап: ежедневно в 03:00, хранение 30 дней"
+    log_info "Автобэкап: ежедневно в 03:00, хранение ${keep_days} дней"
 }
 
 # ============================================================================
@@ -1368,12 +1700,17 @@ do_system_info() {
     get_installed_versions
     get_available_versions
 
+    local os_name
+    os_name=$(lsb_release -ds 2>/dev/null || true)
+    if [[ -z "$os_name" && -f /etc/os-release ]]; then
+        os_name=$(awk -F= '/^PRETTY_NAME=/ {gsub(/"/,"",$2); print $2}' /etc/os-release || true)
+    fi
     echo "  Информация о системе"
     echo "  ─────────────────────────────────────────────"
-    echo "    ОС:            $(lsb_release -ds 2>/dev/null || cat /etc/os-release | grep PRETTY_NAME | cut -d= -f2 | tr -d '"')"
+    echo "    ОС:            ${os_name:-неизвестно}"
     echo "    Ядро:          $(uname -r)"
     echo "    Hostname:      $(hostname)"
-    echo "    IP:            $(hostname -I | awk '{print $1}')"
+    echo "    IP:            $(get_primary_ip)"
     echo ""
     echo "  1С:Предприятие"
     echo "  ─────────────────────────────────────────────"
@@ -1410,14 +1747,15 @@ do_list_repos() {
         return
     fi
 
-    local found=0
+    local found=0 ip_addr
+    ip_addr=$(get_primary_ip)
+    local dir name size
     for dir in "$REPO_DIR"/*/; do
         if [[ -d "$dir" ]]; then
             found=1
-            local name=$(basename "$dir")
-            local size=$(du -sh "$dir" 2>/dev/null | awk '{print $1}')
-            local ip_addr=$(hostname -I | awk '{print $1}')
-            echo "    ${name}  [${size}]"
+            name=$(basename "$dir")
+            size=$(du -sh "$dir" 2>/dev/null | awk '{print $1}')
+            echo "    ${name}  [${size:-?}]"
             echo "      → tcp://${ip_addr}:${REPO_PORT}/${name}"
             echo ""
         fi
@@ -1426,7 +1764,6 @@ do_list_repos() {
     if [[ $found -eq 0 ]]; then
         echo "    (пусто — создайте хранилище из конфигуратора 1С)"
         echo ""
-        local ip_addr=$(hostname -I | awk '{print $1}')
         echo "    Адрес: tcp://${ip_addr}:${REPO_PORT}/<имя_хранилища>"
     fi
     echo ""
@@ -1483,7 +1820,8 @@ do_diagnose() {
 
     # Права
     if [[ -d "$REPO_DIR" ]]; then
-        local owner=$(stat -c '%U:%G' "$REPO_DIR" 2>/dev/null)
+        local owner
+        owner=$(stat -c '%U:%G' "$REPO_DIR" 2>/dev/null || echo "?")
         if [[ "$owner" == "${SVC_USER}:${SVC_GROUP}" ]]; then
             log_info "Права: ${owner}"
         else
@@ -1512,12 +1850,17 @@ do_diagnose() {
     fi
 
     # Диск
-    local disk_usage=$(df / | tail -1 | awk '{print $5}' | tr -d '%')
-    if [[ $disk_usage -lt 90 ]]; then
-        log_info "Диск: ${disk_usage}%"
+    local disk_usage
+    disk_usage=$(df / 2>/dev/null | tail -1 | awk '{print $5}' | tr -d '%' || true)
+    if [[ "$disk_usage" =~ ^[0-9]+$ ]]; then
+        if [[ $disk_usage -lt 90 ]]; then
+            log_info "Диск: ${disk_usage}%"
+        else
+            log_warn "Диск: ${disk_usage}% — мало места!"
+            issues=$((issues + 1))
+        fi
     else
-        log_warn "Диск: ${disk_usage}% — мало места!"
-        issues=$((issues + 1))
+        log_warn "Не удалось определить занятость диска"
     fi
 
     echo ""
@@ -1581,7 +1924,9 @@ do_path_install() {
 
     if [[ -L "$SYMLINK_PATH" || -f "$SYMLINK_PATH" ]]; then
         read -rp "  ${SYMLINK_PATH} уже существует. Перезаписать? (y/N): " answer
-        [[ ! "$answer" =~ ^[Yy]$ ]] && return
+        if [[ ! "$answer" =~ ^[Yy]$ ]]; then
+            return
+        fi
         rm -f "$SYMLINK_PATH"
     fi
 
@@ -1603,13 +1948,211 @@ do_path_uninstall() {
 }
 
 # ============================================================================
+#  ОБНОВЛЕНИЕ СКРИПТА (self-update)
+# ============================================================================
+
+# Извлекает значение SCRIPT_VERSION="..." из файла, не выполняя его
+extract_version() {
+    local file="$1"
+    [[ -f "$file" ]] || return 1
+    awk -F'"' '/^SCRIPT_VERSION=/ {print $2; exit}' "$file"
+}
+
+# Сравнивает две semver-подобные строки. Возвращает:
+#   0 — равны, 1 — A > B, 2 — A < B
+version_compare() {
+    local a="$1" b="$2"
+    [[ "$a" == "$b" ]] && return 0
+    local ia ib
+    IFS='.' read -ra ia <<< "$a"
+    IFS='.' read -ra ib <<< "$b"
+    local len=${#ia[@]}
+    (( ${#ib[@]} > len )) && len=${#ib[@]}
+    local i ai bi
+    for (( i = 0; i < len; i++ )); do
+        ai="${ia[i]:-0}"; bi="${ib[i]:-0}"
+        # Числовая часть (для нечисленных хвостов вроде -beta берём только цифры в начале)
+        ai="${ai%%[!0-9]*}"; bi="${bi%%[!0-9]*}"
+        ai="${ai:-0}"; bi="${bi:-0}"
+        if (( 10#$ai > 10#$bi )); then return 1; fi
+        if (( 10#$ai < 10#$bi )); then return 2; fi
+    done
+    return 0
+}
+
+# Скачивает удалённый скрипт во временный файл. echo'ит путь к файлу.
+download_remote_script() {
+    if ! command -v curl >/dev/null 2>&1; then
+        log_error "Для обновления нужен curl: apt-get install curl" >&2
+        return 1
+    fi
+    local tmp
+    tmp=$(mktemp /tmp/crserver-manager.new.XXXXXX) || return 1
+    local http_code
+    http_code=$(curl -fsSL --max-time 30 -o "$tmp" -w '%{http_code}' "$UPDATE_URL" 2>/dev/null || echo "000")
+    if [[ "$http_code" != "200" ]] || [[ ! -s "$tmp" ]]; then
+        log_error "Не удалось скачать обновление (HTTP ${http_code}) с ${UPDATE_URL}" >&2
+        rm -f "$tmp"
+        return 1
+    fi
+    echo "$tmp"
+}
+
+# Печатает «текущая версия / удалённая версия» и возвращает:
+#   0 — обновление доступно, 1 — уже актуально, 2 — ошибка
+do_self_update_check() {
+    log_step "Проверка обновлений..."
+    echo "  Источник: ${UPDATE_URL}"
+    local tmp
+    tmp=$(download_remote_script) || return 2
+
+    local remote_ver
+    remote_ver=$(extract_version "$tmp" || true)
+    rm -f "$tmp"
+
+    if [[ -z "$remote_ver" ]]; then
+        log_error "Не удалось определить версию в удалённом скрипте"
+        return 2
+    fi
+
+    echo "  Текущая версия:  ${SCRIPT_VERSION}"
+    echo "  В репозитории:   ${remote_ver}"
+
+    local cmp
+    set +e
+    version_compare "$remote_ver" "$SCRIPT_VERSION"; cmp=$?
+    set -e
+
+    case $cmp in
+        0) log_info "Установлена актуальная версия"; return 1 ;;
+        1) log_info "Доступно обновление"; return 0 ;;
+        2) log_warn "Локальная версия новее, чем в репозитории"; return 1 ;;
+    esac
+}
+
+# Выполняет обновление. Аргумент: "force" — пропускает запрос подтверждения
+# и работает даже если версии равны (полезно при ручном hotfix).
+do_self_update() {
+    local force="${1:-}"
+
+    local script_path
+    script_path="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
+
+    if [[ ! -w "$script_path" ]]; then
+        log_error "Нет прав на запись в ${script_path}"
+        return 1
+    fi
+
+    log_step "Скачивание ${UPDATE_URL}..."
+    local tmp
+    tmp=$(download_remote_script) || return 1
+
+    local remote_ver
+    remote_ver=$(extract_version "$tmp" || true)
+    if [[ -z "$remote_ver" ]]; then
+        log_error "В скачанном файле нет SCRIPT_VERSION — обновление отменено"
+        rm -f "$tmp"
+        return 1
+    fi
+
+    # Проверка синтаксиса перед заменой
+    if ! bash -n "$tmp" 2>/tmp/crserver-update-syntax.log; then
+        log_error "Скачанный скрипт содержит синтаксические ошибки:"
+        sed 's/^/    /' /tmp/crserver-update-syntax.log
+        rm -f "$tmp" /tmp/crserver-update-syntax.log
+        return 1
+    fi
+    rm -f /tmp/crserver-update-syntax.log
+
+    echo "  Текущая версия:  ${SCRIPT_VERSION}"
+    echo "  Новая версия:    ${remote_ver}"
+    echo "  Целевой файл:    ${script_path}"
+
+    local cmp
+    set +e
+    version_compare "$remote_ver" "$SCRIPT_VERSION"; cmp=$?
+    set -e
+
+    if [[ "$force" != "force" ]]; then
+        case $cmp in
+            0) log_info "Уже актуальная версия. Используйте --force для принудительной замены."
+               rm -f "$tmp"; return 0 ;;
+            2) log_warn "Локальная версия НОВЕЕ удалённой. Используйте --force для отката."
+               rm -f "$tmp"; return 0 ;;
+        esac
+
+        echo ""
+        read -rp "  Установить новую версию? (Y/n): " answer
+        if [[ "$answer" =~ ^[Nn]$ ]]; then
+            rm -f "$tmp"
+            log_warn "Обновление отменено"
+            return 0
+        fi
+    fi
+
+    # Бэкап текущего файла рядом с ним
+    local backup_path="${script_path}.bak.$(date +%Y%m%d_%H%M%S)"
+    if ! cp -p "$script_path" "$backup_path"; then
+        log_error "Не удалось создать резервную копию"
+        rm -f "$tmp"
+        return 1
+    fi
+    log_info "Резервная копия: ${backup_path}"
+
+    # Сохраняем биты прав (rwxr-xr-x как у Edit, но возьмём текущие)
+    local mode
+    mode=$(stat -c '%a' "$script_path" 2>/dev/null || echo "755")
+
+    # Атомарная замена через mv в пределах одного раздела
+    if ! mv -f "$tmp" "$script_path"; then
+        log_error "Не удалось заменить файл — восстанавливаю из бэкапа"
+        cp -p "$backup_path" "$script_path" || true
+        rm -f "$tmp"
+        return 1
+    fi
+    chmod "$mode" "$script_path"
+
+    log_info "Обновлено: ${SCRIPT_VERSION} → ${remote_ver}"
+    echo ""
+    echo -e "  ${YELLOW}Перезапустите скрипт, чтобы изменения вступили в силу:${NC}"
+    echo "    sudo $script_path"
+    return 0
+}
+
+do_update_menu() {
+    echo ""
+    echo -e "${BOLD}══════════════════════════════════════════════════${NC}"
+    echo -e "  Обновление скрипта"
+    echo -e "${BOLD}══════════════════════════════════════════════════${NC}"
+    echo ""
+    echo "  Текущая версия: ${SCRIPT_VERSION}"
+    echo "  Источник:       ${UPDATE_URL}"
+    echo ""
+    echo "  1) Проверить наличие обновлений"
+    echo "  2) Обновить (с подтверждением)"
+    echo "  3) Обновить принудительно (--force, перезаписать любую версию)"
+    echo ""
+    echo "  0) ← Назад"
+    echo ""
+    read -rp "  Выберите: " choice
+
+    case $choice in
+        1) do_self_update_check || true; read -rp "  Нажмите Enter..." _ ;;
+        2) do_self_update;        read -rp "  Нажмите Enter..." _ ;;
+        3) do_self_update force;  read -rp "  Нажмите Enter..." _ ;;
+        0) return ;;
+        *) log_warn "Неверный выбор"; sleep 1 ;;
+    esac
+}
+
+# ============================================================================
 #  СПРАВКА
 # ============================================================================
 
 do_help() {
     echo ""
     echo -e "${BOLD}══════════════════════════════════════════════════${NC}"
-    echo -e "  Справка — crserver-manager.sh"
+    echo -e "  Справка — crserver-manager.sh v${SCRIPT_VERSION}"
     echo -e "${BOLD}══════════════════════════════════════════════════${NC}"
     echo ""
     echo "  Использование:"
@@ -1626,6 +2169,10 @@ do_help() {
     echo "    sudo ./crserver-manager.sh versions     список версий"
     echo "    sudo ./crserver-manager.sh path-install добавить в PATH"
     echo "    sudo ./crserver-manager.sh path-remove  удалить из PATH"
+    echo "    sudo ./crserver-manager.sh update       обновить скрипт"
+    echo "      └─ update --check    проверить наличие обновлений"
+    echo "      └─ update --force    обновить принудительно"
+    echo "    sudo ./crserver-manager.sh version      версия скрипта"
     echo "    sudo ./crserver-manager.sh help         эта справка"
     echo ""
     echo "  Структура каталога пакетов:"
@@ -1670,8 +2217,8 @@ main_menu() {
         clear 2>/dev/null || true
         echo ""
         echo -e "${BOLD}══════════════════════════════════════════════════${NC}"
-        echo -e "${BOLD}  Сервер хранилища 1С:Предприятие${NC}"
-        echo -e "  Версия: ${ACTIVE_VERSION:-—}   Статус: ${status_color}${status_text}${NC}"
+        echo -e "${BOLD}  Сервер хранилища 1С:Предприятие${NC}   ${CYAN}v${SCRIPT_VERSION}${NC}"
+        echo -e "  Версия 1С: ${ACTIVE_VERSION:-—}   Статус: ${status_color}${status_text}${NC}"
         if [[ ${#INSTALLED_VERSIONS[@]} -gt 1 ]]; then
             echo -e "  Установлено: ${INSTALLED_VERSIONS[*]}"
         fi
@@ -1684,7 +2231,8 @@ main_menu() {
         echo "  5) Бэкап и восстановление"
         echo "  6) Инструменты"
         echo "  7) Быстрый вызов (PATH)"
-        echo "  8) Справка"
+        echo "  8) Обновление скрипта"
+        echo "  9) Справка"
         echo ""
         echo "  0) Выход"
         echo ""
@@ -1698,7 +2246,8 @@ main_menu() {
             5) do_backup_menu ;;
             6) do_tools_menu ;;
             7) do_path_menu ;;
-            8) do_help ;;
+            8) do_update_menu ;;
+            9) do_help ;;
             0) echo ""; exit 0 ;;
             *) log_warn "Неверный выбор" ;;
         esac
@@ -1715,12 +2264,37 @@ load_config
 case "${1:-}" in
     install)       do_full_install ;;
     uninstall)     do_full_uninstall ;;
-    start)         systemctl start ${SERVICE_NAME} && log_info "Запущен" ;;
-    stop)          systemctl stop ${SERVICE_NAME} && log_info "Остановлен" ;;
-    restart)       systemctl restart ${SERVICE_NAME} && log_info "Перезапущен" ;;
+    start)
+        if systemctl start ${SERVICE_NAME}; then
+            log_info "Запущен"
+        else
+            log_error "Ошибка запуска (journalctl -u ${SERVICE_NAME} -n 20)"
+            exit 1
+        fi
+        ;;
+    stop)
+        if systemctl stop ${SERVICE_NAME}; then
+            log_info "Остановлен"
+        else
+            log_error "Ошибка остановки"
+            exit 1
+        fi
+        ;;
+    restart)
+        if systemctl restart ${SERVICE_NAME}; then
+            log_info "Перезапущен"
+        else
+            log_error "Ошибка перезапуска (journalctl -u ${SERVICE_NAME} -n 20)"
+            exit 1
+        fi
+        ;;
     status)
-        systemctl status ${SERVICE_NAME} --no-pager 2>/dev/null || log_warn "Служба не найдена"
-        ss -tlnp | grep ":${REPO_PORT}" 2>/dev/null || true
+        if [[ ! -f /etc/systemd/system/${SERVICE_NAME}.service ]]; then
+            log_warn "Служба не установлена"
+            exit 1
+        fi
+        systemctl status ${SERVICE_NAME} --no-pager || true
+        ss -tlnp 2>/dev/null | grep ":${REPO_PORT}" || true
         ;;
     logs)          journalctl -u ${SERVICE_NAME} -n 50 --no-pager ;;
     backup)        do_backup ;;
@@ -1739,6 +2313,21 @@ case "${1:-}" in
         ;;
     path-install)  do_path_install ;;
     path-remove)   do_path_uninstall ;;
+    update)
+        case "${2:-}" in
+            ""|--yes|-y) do_self_update ;;
+            --check)     do_self_update_check || true ;;
+            --force)     do_self_update force ;;
+            *)
+                log_error "Неизвестный аргумент: $2"
+                echo "  Использование: $0 update [--check|--force]"
+                exit 1
+                ;;
+        esac
+        ;;
+    version|--version|-V)
+        echo "crserver-manager.sh ${SCRIPT_VERSION}"
+        ;;
     help|--help|-h) do_help ;;
     "")            main_menu ;;
     *)
