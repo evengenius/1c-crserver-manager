@@ -1,1 +1,2 @@
-.claude/settings.local.json
+# Локальные настройки Claude Code (не должны попадать в репозиторий)
+.claude/
