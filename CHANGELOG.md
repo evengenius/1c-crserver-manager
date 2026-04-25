@@ -7,6 +7,37 @@
 
 См. [ROADMAP.md](ROADMAP.md).
 
+## [2.1.0] — 2026-04-25
+
+### Бэкапы
+- Ротация по числу копий: пункт меню «Оставить только последние N» и
+  выбор политики в `do_setup_cron_backup` («по возрасту» / «по числу
+  копий»). Cron-скрипт теперь поддерживает оба механизма через
+  переменные `KEEP_DAYS` и `KEEP_LAST`.
+- Команда `crserver verify <архив.tar.gz>` — `tar -tzf`-проверка
+  целостности любого архива. Возвращает exit 0 при успехе, 1 при
+  повреждении. Печатает размер и число записей.
+- Пункт меню «Проверить целостность архива (verify)» с интерактивным
+  выбором архива из списка инстанса.
+- `make_tar_archive` helper использует `pv` для прогресс-бара, если
+  утилита установлена и stdout — tty. На non-tty (cron, pipe) `pv`
+  пропускается. Helper применим к новым местам вызова tar.
+
+### CI
+- `.github/workflows/ci.yml` — три job:
+  1. ShellCheck с `--severity=warning` (исключения SC2155/SC2128/SC1091).
+  2. `bash -n` syntax check.
+  3. Smoke-test в Docker debian:12 (запуск `version`, `help`).
+
+### UX
+- `crserver version` и `crserver help` больше не требуют root: эти
+  команды перехватываются до `check_root`. Раньше любой невинный
+  `crserver --version` падал с «Запустите от root».
+
+### Code quality
+- `confirm`-helper применён в первом call-site (удаление бэкапа
+  по номеру). Миграция остальных идёт инкрементально.
+
 ## [2.0.4] — 2026-04-25
 
 ### Корректность
@@ -139,7 +170,8 @@ REPO_DIR, LOG_DIR), своя версия платформы, свои хран�
 
 См. историю в `git log`.
 
-[Unreleased]: https://github.com/evengenius/1c-crserver-manager/compare/v2.0.4...HEAD
+[Unreleased]: https://github.com/evengenius/1c-crserver-manager/compare/v2.1.0...HEAD
+[2.1.0]: https://github.com/evengenius/1c-crserver-manager/compare/v2.0.4...v2.1.0
 [2.0.4]: https://github.com/evengenius/1c-crserver-manager/compare/v2.0.3...v2.0.4
 [2.0.3]: https://github.com/evengenius/1c-crserver-manager/compare/v2.0.2...v2.0.3
 [2.0.2]: https://github.com/evengenius/1c-crserver-manager/compare/v2.0.1...v2.0.2

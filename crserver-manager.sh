@@ -33,7 +33,7 @@ set -euo pipefail
 # --- Версия скрипта ---
 # При выпуске новой версии увеличить и закоммитить в репозиторий.
 # Используется для проверки обновлений (см. do_self_update).
-SCRIPT_VERSION="2.0.4"
+SCRIPT_VERSION="2.1.0"
 
 # --- Источник обновлений ---
 UPDATE_REPO="evengenius/1c-crserver-manager"
@@ -85,6 +85,31 @@ log_info()  { echo -e "${GREEN}[✓]${NC} $1"; }
 log_warn()  { echo -e "${YELLOW}[!]${NC} $1"; }
 log_error() { echo -e "${RED}[✗]${NC} $1"; }
 log_step()  { echo -e "${CYAN}[→]${NC} $1"; }
+
+# Создаёт сжатый tar-архив. Если установлен pv — выводит прогресс по
+# размеру входных данных. Иначе обычный tar -czf.
+#   $1 — путь к выходному архиву
+#   $2 — каталог -C для tar
+#   $3 — имя/паттерн внутри -C
+#   $4 — опционально: путь к лог-файлу stderr (по умолчанию /dev/null)
+make_tar_archive() {
+    local archive="$1" cdir="$2" target="$3" errlog="${4:-/dev/null}"
+    if command -v pv >/dev/null 2>&1 && [[ -t 1 ]]; then
+        # Считаем размер для прогресс-бара. На больших каталогах du занимает
+        # секунды — для интерактива это приемлемо. В non-tty режиме pv не
+        # нужен (нет смысла в анимации).
+        local total_kb
+        total_kb=$(du -sk "${cdir}/${target}" 2>/dev/null | awk '{print $1+0}')
+        local total_bytes=$(( total_kb * 1024 ))
+        if (( total_bytes > 0 )); then
+            tar -cf - --ignore-failed-read -C "$cdir" "$target" 2>"$errlog" \
+              | pv -s "$total_bytes" \
+              | gzip > "$archive" 2>>"$errlog"
+            return ${PIPESTATUS[0]}
+        fi
+    fi
+    tar -czf "$archive" -C "$cdir" "$target" --ignore-failed-read 2>"$errlog"
+}
 
 # Универсальное Y/N подтверждение.
 #   confirm "Текст вопроса" [yes|no]   — второй аргумент задаёт умолчание
@@ -2940,7 +2965,9 @@ do_backup_menu() {
         echo "  2) Восстановить инстанс из бэкапа"
         echo "  3) Настроить автоматический бэкап (cron)"
         echo "  4) Удалить старые бэкапы (по возрасту)"
-        echo "  5) Удалить бэкап по номеру"
+        echo "  5) Оставить только последние N бэкапов"
+        echo "  6) Удалить бэкап по номеру"
+        echo "  7) Проверить целостность архива (verify)"
         echo ""
         echo "  0) ← Назад"
         echo ""
@@ -2965,6 +2992,15 @@ do_backup_menu() {
                 fi
                 ;;
             5)
+                read -rp "  Сколько последних бэкапов оставить? [14]: " keep_n
+                keep_n="${keep_n:-14}"
+                if ! [[ "$keep_n" =~ ^[0-9]+$ ]] || (( keep_n < 1 )); then
+                    log_error "Число должно быть положительным"
+                else
+                    backup_rotate_keep_last "${INST_NAME}" "$keep_n"
+                fi
+                ;;
+            6)
                 if [[ ${#backup_files[@]} -eq 0 ]]; then
                     log_warn "Нет бэкапов для удаления"
                 else
@@ -2975,8 +3011,7 @@ do_backup_menu() {
                         local target="${backup_files[$((num - 1))]}"
                         echo ""
                         echo "  Удалить: $(basename "$target")?"
-                        read -rp "  (y/N): " ans
-                        if [[ "$ans" =~ ^[Yy]$ ]]; then
+                        if confirm "Подтверждаете" no; then
                             rm -f "$target"
                             log_info "Удалён: $(basename "$target")"
                         fi
@@ -2985,10 +3020,52 @@ do_backup_menu() {
                     fi
                 fi
                 ;;
+            7)
+                if [[ ${#backup_files[@]} -eq 0 ]]; then
+                    log_warn "Нет бэкапов для проверки"
+                else
+                    read -rp "  Номер бэкапа (или 0 для отмены): " num
+                    if [[ "$num" =~ ^[0-9]+$ ]] && (( num >= 1 && num <= ${#backup_files[@]} )); then
+                        local target="${backup_files[$((num - 1))]}"
+                        echo ""
+                        log_step "tar -tzf $(basename "$target")..."
+                        if tar -tzf "$target" >/dev/null 2>&1; then
+                            log_info "OK: архив целый ($(du -sh "$target" 2>/dev/null | awk '{print $1}'))"
+                        else
+                            log_error "FAIL: архив повреждён"
+                        fi
+                    fi
+                fi
+                ;;
             0) return ;;
             *) log_warn "Неверный выбор" ;;
         esac
     done
+}
+
+# Удалить все бэкапы инстанса, кроме последних N (по mtime).
+#   $1 — имя инстанса, $2 — N (>=1)
+backup_rotate_keep_last() {
+    local inst="$1" keep="$2"
+    if [[ ! -d "$BACKUP_DIR" ]]; then
+        log_warn "Каталог бэкапов не существует"
+        return 0
+    fi
+    # Полные бэкапы инстанса: <inst>_<ts>.tar.gz (но не <inst>_repo_*).
+    # Сортируем по mtime по убыванию, пропускаем первые $keep, остальное — удаляем.
+    local list
+    list=$(find "$BACKUP_DIR" -maxdepth 1 -name "${inst}_[0-9]*.tar.gz" \
+        -printf '%T@ %p\n' 2>/dev/null | sort -nr | tail -n +$((keep + 1)) | cut -d' ' -f2-)
+    if [[ -z "$list" ]]; then
+        log_info "Нечего удалять (бэкапов не больше ${keep})"
+        return 0
+    fi
+    local count=0 f
+    while IFS= read -r f; do
+        [[ -z "$f" ]] && continue
+        rm -f "$f" && count=$((count + 1))
+    done <<< "$list"
+    log_info "Удалено старых бэкапов: ${count}, оставлено последних ${keep}"
 }
 
 # Бэкап всего REPO_DIR текущего инстанса
@@ -3119,17 +3196,37 @@ do_setup_cron_backup() {
         return 1
     fi
     local cron_script="/usr/local/bin/crserver-backup-${INST_NAME}.sh"
-    local keep_days=30
+    local keep_days=30 keep_last=0
 
-    read -rp "  Хранить N дней [30]: " input_days
-    if [[ -n "$input_days" ]]; then
-        if [[ "$input_days" =~ ^[0-9]+$ ]] && (( input_days >= 1 )); then
-            keep_days="$input_days"
-        else
-            log_error "Срок должен быть положительным числом"
-            return
-        fi
-    fi
+    echo ""
+    echo "  Политика хранения:"
+    echo "    1) По возрасту (хранить N дней)"
+    echo "    2) По числу копий (оставлять последние N)"
+    read -rp "  Выберите [1]: " policy
+    policy="${policy:-1}"
+    case "$policy" in
+        2)
+            read -rp "  Сколько последних копий хранить? [14]: " input_n
+            input_n="${input_n:-14}"
+            if ! [[ "$input_n" =~ ^[0-9]+$ ]] || (( input_n < 1 )); then
+                log_error "Число должно быть положительным"
+                return
+            fi
+            keep_last="$input_n"
+            keep_days=0
+            ;;
+        *)
+            read -rp "  Хранить N дней [30]: " input_days
+            if [[ -n "$input_days" ]]; then
+                if [[ "$input_days" =~ ^[0-9]+$ ]] && (( input_days >= 1 )); then
+                    keep_days="$input_days"
+                else
+                    log_error "Срок должен быть положительным числом"
+                    return
+                fi
+            fi
+            ;;
+    esac
 
     cat > "$cron_script" << EOFCRON
 #!/bin/bash
@@ -3138,6 +3235,7 @@ INST="${INST_NAME}"
 BACKUP_DIR="${BACKUP_DIR}"
 REPO_DIR="${INST_REPO_DIR}"
 KEEP_DAYS="${keep_days}"
+KEEP_LAST="${keep_last}"
 
 mkdir -p "\$BACKUP_DIR"
 timestamp=\$(date +%Y%m%d_%H%M%S)
@@ -3155,14 +3253,27 @@ if ! tar -tzf "\$archive" >/dev/null 2>>"\$log_file"; then
     rm -f "\$archive"
     exit 1
 fi
-find "\$BACKUP_DIR" -maxdepth 1 -name "\${INST}_*.tar.gz" -mtime "+\${KEEP_DAYS}" -delete 2>/dev/null
+# Ротация: либо по возрасту (KEEP_DAYS>0), либо по числу копий (KEEP_LAST>0).
+if [[ "\$KEEP_DAYS" -gt 0 ]]; then
+    find "\$BACKUP_DIR" -maxdepth 1 -name "\${INST}_[0-9]*.tar.gz" -mtime "+\${KEEP_DAYS}" -delete 2>/dev/null
+fi
+if [[ "\$KEEP_LAST" -gt 0 ]]; then
+    find "\$BACKUP_DIR" -maxdepth 1 -name "\${INST}_[0-9]*.tar.gz" \\
+        -printf '%T@ %p\n' 2>/dev/null \\
+      | sort -nr | tail -n +\$((KEEP_LAST + 1)) | cut -d' ' -f2- \\
+      | xargs -r rm -f 2>/dev/null
+fi
 EOFCRON
 
     chmod +x "$cron_script"
     local cron_line="0 3 * * * ${cron_script}"
     (crontab -l 2>/dev/null | grep -F -v "$cron_script"; echo "$cron_line") | crontab -
 
-    log_info "Автобэкап инстанса ${INST_NAME}: ежедневно в 03:00, хранение ${keep_days} дней"
+    if (( keep_last > 0 )); then
+        log_info "Автобэкап ${INST_NAME}: ежедневно в 03:00, хранение последних ${keep_last} копий"
+    else
+        log_info "Автобэкап ${INST_NAME}: ежедневно в 03:00, хранение ${keep_days} дней"
+    fi
 }
 
 # ============================================================================
@@ -3724,6 +3835,7 @@ do_help() {
     echo "    sudo ./crserver-manager.sh backup                  создать бэкап"
     echo "    sudo ./crserver-manager.sh diagnose                диагностика"
     echo "    sudo ./crserver-manager.sh healthcheck             одностроковый OK/FAIL для мониторинга"
+    echo "    sudo ./crserver-manager.sh verify <архив>          проверить целостность tar-архива"
     echo "    sudo ./crserver-manager.sh versions                список платформ"
     echo "    sudo ./crserver-manager.sh path-install/path-remove"
     echo ""
@@ -4377,6 +4489,19 @@ cli_run_on_instance() {
 #  ТОЧКА ВХОДА
 # ============================================================================
 
+# Эти команды не требуют root: только читают локальные данные/печатают help.
+# Все остальные пути проходят через check_root после парсинга аргументов.
+case "${1:-}" in
+    version|--version|-V|help|--help|-h)
+        # Перехватываем сразу — без -i и без check_root.
+        case "${1:-}" in
+            version|--version|-V) echo "crserver-manager.sh ${SCRIPT_VERSION}" ;;
+            help|--help|-h) do_help ;;
+        esac
+        exit 0
+        ;;
+esac
+
 check_root
 
 # Парсим необязательный -i <name>
@@ -4414,6 +4539,28 @@ case "${1:-}" in
     uninstall)     do_full_uninstall ;;
     start|stop|restart|status|logs|backup|diagnose|healthcheck)
         cli_run_on_instance "$1"
+        ;;
+    backup-verify|verify)
+        # crserver verify <архив.tar.gz> — без -i, проверка любого архива.
+        if [[ -z "${2:-}" ]]; then
+            log_error "Использование: $0 verify <архив.tar.gz>"
+            exit 1
+        fi
+        if [[ ! -f "$2" ]]; then
+            log_error "Файл не найден: $2"
+            exit 1
+        fi
+        echo "Проверяю $2..."
+        if tar -tzf "$2" >/dev/null 2>&1; then
+            local _size _entries
+            _size=$(du -sh "$2" 2>/dev/null | awk '{print $1}')
+            _entries=$(tar -tzf "$2" 2>/dev/null | wc -l)
+            log_info "OK: архив целый, ${_entries} записей, размер ${_size:-?}"
+            exit 0
+        else
+            log_error "FAIL: архив повреждён"
+            exit 1
+        fi
         ;;
     repo|repos)
         shift

@@ -1,0 +1,59 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  shellcheck:
+    runs-on: ubuntu-latest
+    name: ShellCheck
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run shellcheck
+        # SC2155 — допускаем (`local x=$(...)` повсеместно).
+        # SC2128 — в некоторых местах массивы интерпретируются как первый
+        # элемент (для информационного вывода) — допустимо.
+        # SC1091 — не разворачиваем внешние source-файлы (их нет, но на
+        # всякий случай).
+        run: |
+          shellcheck --version
+          shellcheck \
+            --severity=warning \
+            --shell=bash \
+            --exclude=SC2155,SC2128,SC1091 \
+            crserver-manager.sh
+
+  syntax:
+    runs-on: ubuntu-latest
+    name: bash -n
+    steps:
+      - uses: actions/checkout@v4
+      - name: Bash syntax check
+        run: bash -n crserver-manager.sh
+
+  smoke-test:
+    runs-on: ubuntu-latest
+    name: Smoke test (Docker debian:12)
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run smoke test in Docker
+        run: |
+          docker run --rm \
+            -v "$PWD":/work \
+            -w /work \
+            debian:12 \
+            bash -c '
+              set -euo pipefail
+              apt-get update -qq && apt-get install -y -qq bash >/dev/null
+              # Минимальный smoke: парсинг, отображение версии, help.
+              bash -n crserver-manager.sh
+              # version и help работают без root, но check_root первый —
+              # обходим, запустив как root в контейнере. Они работают.
+              ./crserver-manager.sh version
+              ./crserver-manager.sh help >/dev/null
+              echo "smoke OK"
+            '
