@@ -18,22 +18,24 @@
 скрипт удобнее для CI/Ansible-сценариев.
 
 ### Корректность и UX
-- ⏳ Допуск повторного запуска `do_full_install` после прерванной первой
-  установки
-- ⏳ `validate_ip` принимает только октеты 0–255 и проверяет маску /0–32
-- ⏳ Валидация всех аргументов CLI `instance create` (порт, имя, пути)
-- ⏳ Единый `confirm` helper вместо разных Y/n vs y/N
-- ⏳ Поддержка `NO_COLOR=1` и автоопределение non-tty
+- ✅ Допуск повторного запуска `do_full_install` после прерванной первой
+  установки (v2.0.4)
+- ✅ `validate_ip` принимает только октеты 0–255 и проверяет маску /0–32 (v2.0.4)
+- ✅ Валидация всех аргументов CLI `instance create` (порт, имя, пути) (v2.0.4)
+- ✅ Единый `confirm` helper вместо разных Y/n vs y/N (v2.0.4) — добавлен
+  helper, миграция существующих call-sites идёт инкрементально
+- ✅ Поддержка `NO_COLOR=1` и автоопределение non-tty (v2.0.4)
+- ⏳ Миграция всех `read -rp ... (y/N)` на `confirm`-helper
 - ⏳ Подтверждение деструктивных операций унифицировано (имя инстанса
   везде, `DELETE` только для full-uninstall)
 - ⏳ Единый `log_to_file` в `/var/log/1c-crserver/manager.log` для аудита
   действий
 
 ### Автоматизация
-- ⏳ Bash-completion для всех CLI-команд
-- ⏳ `instance list --json` для интеграции с Ansible/мониторингом
-- ⏳ `crserver healthcheck [-i name]` — exit-код для systemd `ExecStartPost`
-  и мониторинга
+- ✅ Bash-completion для всех CLI-команд (v2.0.4, `contrib/crserver.bash-completion`)
+- ✅ `instance list --json` для интеграции с Ansible/мониторингом (v2.0.4)
+- ✅ `crserver healthcheck [-i name]` — exit-код для systemd `ExecStartPost`
+  и мониторинга (v2.0.4)
 - ⏳ Dry-run (`--dry-run`) для всех деструктивных операций
 - ⏳ shellcheck-чистота скрипта (с CI-проверкой)
 

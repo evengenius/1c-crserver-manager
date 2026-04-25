@@ -7,6 +7,37 @@
 
 См. [ROADMAP.md](ROADMAP.md).
 
+## [2.0.4] — 2026-04-25
+
+### Корректность
+- `do_full_install` корректно обрабатывает наполовину созданный инстанс
+  (после прерванной первой установки): предлагает либо открыть меню
+  инстанса для запуска/настройки, либо удалить и переустановить с нуля.
+  Раньше повторный запуск падал на «инстанс уже существует».
+- `validate_ip` строго проверяет октеты 0–255 и маску /0–32. Раньше
+  проходили строки вида `999.0.0.0/99` и числа с ведущими нулями.
+- CLI `instance create` валидирует все аргументы: формат версии
+  (`8.3.NN.NNNN`), её установленность, диапазон порта 1–65535, коллизию
+  с другими инстансами, абсолютность путей и отсутствие переносов строк.
+
+### UX
+- Поддержка [`NO_COLOR`](https://no-color.org/) и автоматическое
+  отключение цветов, когда stdout не tty (pipe в файл, cron-stdout).
+- Единый `confirm` helper для Y/N-вопросов с уважением к stdin-не-tty
+  (для CI берёт значение по умолчанию). Helper доступен новым call-sites,
+  миграция существующих идёт инкрементально (см. ROADMAP).
+
+### Автоматизация
+- `crserver instance list --json` — машинно-читаемый список инстансов
+  для Ansible/мониторинга. Поля: `name`, `status`, `version`, `port`,
+  `repo_dir`, `log_dir`, `is_default`. Без зависимости от `jq`.
+- `crserver [-i name] healthcheck` — однострочный `OK ... ` / `FAIL ...`
+  с exit 0/1. Подходит для systemd `ExecStartPost=`, мониторинга,
+  cron-проверок.
+- `contrib/crserver.bash-completion` — bash-completion для всех команд,
+  имён инстансов (после `-i`), установленных версий 1С (после
+  `--version`) и хранилищ выбранного инстанса.
+
 ## [2.0.3] — 2026-04-25
 
 ### Безопасность операций
@@ -108,7 +139,8 @@ REPO_DIR, LOG_DIR), своя версия платформы, свои хран�
 
 См. историю в `git log`.
 
-[Unreleased]: https://github.com/evengenius/1c-crserver-manager/compare/v2.0.3...HEAD
+[Unreleased]: https://github.com/evengenius/1c-crserver-manager/compare/v2.0.4...HEAD
+[2.0.4]: https://github.com/evengenius/1c-crserver-manager/compare/v2.0.3...v2.0.4
 [2.0.3]: https://github.com/evengenius/1c-crserver-manager/compare/v2.0.2...v2.0.3
 [2.0.2]: https://github.com/evengenius/1c-crserver-manager/compare/v2.0.1...v2.0.2
 [2.0.1]: https://github.com/evengenius/1c-crserver-manager/compare/v2.0.0...v2.0.1

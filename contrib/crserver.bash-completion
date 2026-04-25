@@ -1,0 +1,152 @@
+# bash-completion для crserver-manager.sh
+#
+# Установка:
+#   sudo cp contrib/crserver.bash-completion /etc/bash_completion.d/crserver
+#   . /etc/bash_completion.d/crserver   # или открыть новую сессию
+#
+# Поддерживает корневые команды, instance/repo подкоманды, имена существующих
+# инстансов после -i и опций --version из реально установленных версий 1С.
+
+_crserver_instances() {
+    local d="/etc/1c-crserver/instances"
+    [[ -d "$d" ]] || return
+    (cd "$d" 2>/dev/null && ls *.conf 2>/dev/null | sed 's/\.conf$//')
+}
+
+_crserver_versions() {
+    [[ -d /opt/1cv8/x86_64 ]] || return
+    (cd /opt/1cv8/x86_64 2>/dev/null && \
+        for d in */; do
+            [[ -f "${d}crserver" ]] && echo "${d%/}"
+        done)
+}
+
+_crserver_repos() {
+    # Хранилища инстанса по умолчанию или указанного через -i
+    local inst="$1"
+    local conf="/etc/1c-crserver/instances/${inst}.conf"
+    [[ -f "$conf" ]] || return
+    local repo_dir
+    repo_dir=$(awk -F'"' '/^REPO_DIR=/ {print $2; exit}' "$conf" 2>/dev/null)
+    [[ -d "$repo_dir" ]] || return
+    (cd "$repo_dir" 2>/dev/null && \
+        for d in */; do
+            [[ -d "$d" ]] && echo "${d%/}"
+        done)
+}
+
+_crserver() {
+    local cur prev words cword
+    _init_completion 2>/dev/null || {
+        cur="${COMP_WORDS[COMP_CWORD]}"
+        prev="${COMP_WORDS[COMP_CWORD-1]}"
+        words=("${COMP_WORDS[@]}")
+        cword=$COMP_CWORD
+    }
+
+    # Парсим уже введённые слова, чтобы понять контекст
+    local cli_inst="" cmd="" subcmd="" sub2=""
+    local i=1
+    while (( i < cword )); do
+        case "${words[i]}" in
+            -i|--instance)
+                cli_inst="${words[i+1]:-}"
+                i=$((i+2))
+                continue
+                ;;
+            -*)
+                i=$((i+1))
+                continue
+                ;;
+            *)
+                if [[ -z "$cmd" ]]; then
+                    cmd="${words[i]}"
+                elif [[ -z "$subcmd" ]]; then
+                    subcmd="${words[i]}"
+                elif [[ -z "$sub2" ]]; then
+                    sub2="${words[i]}"
+                fi
+                i=$((i+1))
+                ;;
+        esac
+    done
+
+    # Завершение имени инстанса после -i
+    if [[ "$prev" == "-i" || "$prev" == "--instance" ]]; then
+        COMPREPLY=( $(compgen -W "$(_crserver_instances)" -- "$cur") )
+        return 0
+    fi
+
+    # Корневые команды
+    local root_cmds="install uninstall start stop restart status logs backup diagnose healthcheck repo instance versions path-install path-remove update version help -i --instance"
+    if [[ -z "$cmd" ]]; then
+        COMPREPLY=( $(compgen -W "$root_cmds" -- "$cur") )
+        return 0
+    fi
+
+    case "$cmd" in
+        instance|instances)
+            local inst_subs="list create delete set-default start stop restart status logs"
+            if [[ -z "$subcmd" ]]; then
+                COMPREPLY=( $(compgen -W "$inst_subs" -- "$cur") )
+                return 0
+            fi
+            case "$subcmd" in
+                list)
+                    COMPREPLY=( $(compgen -W "--json" -- "$cur") )
+                    return 0
+                    ;;
+                delete|set-default|start|stop|restart|status|logs)
+                    if [[ -z "$sub2" ]]; then
+                        COMPREPLY=( $(compgen -W "$(_crserver_instances)" -- "$cur") )
+                        return 0
+                    fi
+                    if [[ "$subcmd" == "delete" ]]; then
+                        COMPREPLY=( $(compgen -W "--purge-data" -- "$cur") )
+                    fi
+                    ;;
+                create)
+                    case "$prev" in
+                        --version) COMPREPLY=( $(compgen -W "$(_crserver_versions)" -- "$cur") ); return 0 ;;
+                        --repo-dir|--log-dir) COMPREPLY=( $(compgen -d -- "$cur") ); return 0 ;;
+                    esac
+                    COMPREPLY=( $(compgen -W "--version --port --repo-dir --log-dir" -- "$cur") )
+                    return 0
+                    ;;
+            esac
+            ;;
+        repo|repos)
+            local repo_subs="list info create delete rename backup restore"
+            if [[ -z "$subcmd" ]]; then
+                COMPREPLY=( $(compgen -W "$repo_subs" -- "$cur") )
+                return 0
+            fi
+            local target_inst="$cli_inst"
+            [[ -z "$target_inst" ]] && target_inst=$(awk '{print; exit}' /etc/1c-crserver/default-instance 2>/dev/null)
+            case "$subcmd" in
+                info|delete|rename|backup|restore)
+                    if [[ -z "$sub2" ]]; then
+                        COMPREPLY=( $(compgen -W "$(_crserver_repos "$target_inst")" -- "$cur") )
+                        return 0
+                    fi
+                    if [[ "$subcmd" == "rename" ]]; then
+                        # второе имя — произвольное, не подсказываем
+                        return 0
+                    fi
+                    if [[ "$subcmd" == "restore" ]]; then
+                        COMPREPLY=( $(compgen -f -- "$cur") )
+                        return 0
+                    fi
+                    ;;
+            esac
+            ;;
+        update)
+            COMPREPLY=( $(compgen -W "--check --force --yes -y" -- "$cur") )
+            return 0
+            ;;
+    esac
+}
+
+complete -F _crserver crserver
+complete -F _crserver crserver-manager.sh
+complete -F _crserver ./crserver-manager.sh

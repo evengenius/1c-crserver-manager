@@ -33,7 +33,7 @@ set -euo pipefail
 # --- Версия скрипта ---
 # При выпуске новой версии увеличить и закоммитить в репозиторий.
 # Используется для проверки обновлений (см. do_self_update).
-SCRIPT_VERSION="2.0.3"
+SCRIPT_VERSION="2.0.4"
 
 # --- Источник обновлений ---
 UPDATE_REPO="evengenius/1c-crserver-manager"
@@ -67,19 +67,46 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PACKAGES_DIR="${SCRIPT_DIR}/${PACKAGES_DIR_NAME}"
 
 # --- Цвета ---
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-BLUE='\033[0;34m'
-CYAN='\033[0;36m'
-BOLD='\033[1m'
-NC='\033[0m'
+# NO_COLOR (https://no-color.org/) или не-tty stdout — отключаем escape-коды.
+if [[ -n "${NO_COLOR:-}" ]] || [[ ! -t 1 ]]; then
+    RED=''; GREEN=''; YELLOW=''; BLUE=''; CYAN=''; BOLD=''; NC=''
+else
+    RED=$'\033[0;31m'
+    GREEN=$'\033[0;32m'
+    YELLOW=$'\033[1;33m'
+    BLUE=$'\033[0;34m'
+    CYAN=$'\033[0;36m'
+    BOLD=$'\033[1m'
+    NC=$'\033[0m'
+fi
 
 # --- Логирование ---
 log_info()  { echo -e "${GREEN}[✓]${NC} $1"; }
 log_warn()  { echo -e "${YELLOW}[!]${NC} $1"; }
 log_error() { echo -e "${RED}[✗]${NC} $1"; }
 log_step()  { echo -e "${CYAN}[→]${NC} $1"; }
+
+# Универсальное Y/N подтверждение.
+#   confirm "Текст вопроса" [yes|no]   — второй аргумент задаёт умолчание
+#   exit 0 — подтверждено, exit 1 — отказ
+# Если stdin не tty — берём umolчание без запроса (для CI/автоматизации).
+confirm() {
+    local question="$1"
+    local default="${2:-no}"
+    local hint="(y/N)"
+    [[ "$default" == "yes" ]] && hint="(Y/n)"
+    if [[ ! -t 0 ]]; then
+        [[ "$default" == "yes" ]]
+        return $?
+    fi
+    local ans
+    read -rp "  ${question} ${hint}: " ans
+    if [[ -z "$ans" ]]; then
+        [[ "$default" == "yes" ]]
+        return $?
+    fi
+    [[ "$ans" =~ ^[Yy]$ ]]
+}
 
 # --- Контекст текущего инстанса (заполняется select_instance / instance_load) ---
 SELECTED_INSTANCE=""
@@ -1650,8 +1677,40 @@ do_full_install() {
         return
     fi
     if instance_exists "$inst_name"; then
-        log_error "Инстанс '${inst_name}' уже существует"
-        return
+        # Возможный сценарий: первая установка упала на systemctl start,
+        # инстанс был сохранён, но не запущен. Предлагаем варианты вместо
+        # тупика "уже существует".
+        local existing_status
+        existing_status=$(instance_status "$inst_name")
+        echo ""
+        log_warn "Инстанс '${inst_name}' уже существует (статус: ${existing_status})"
+        echo "  Варианты:"
+        echo "    1) Открыть меню инстанса (запуск/настройка/удаление)"
+        echo "    2) Удалить и переустановить с нуля"
+        echo "    0) Отмена"
+        read -rp "  Выберите [0]: " resume_choice
+        case "${resume_choice:-0}" in
+            1)
+                SELECTED_INSTANCE="$inst_name"
+                do_instance_service
+                return
+                ;;
+            2)
+                log_step "Удаление существующего инстанса '${inst_name}'..."
+                systemctl stop "crserver@${inst_name}.service" 2>/dev/null || true
+                systemctl disable "crserver@${inst_name}.service" 2>/dev/null || true
+                local _old_port
+                _old_port=$(awk -F'"' '/^REPO_PORT=/ {print $2; exit}' "${INSTANCES_DIR}/${inst_name}.conf" 2>/dev/null || true)
+                cleanup_instance_chain "$inst_name"
+                [[ -n "$_old_port" ]] && remove_input_for_port "$_old_port"
+                rm -f "${INSTANCES_DIR}/${inst_name}.conf"
+                log_info "Удалено. Продолжаю установку."
+                ;;
+            *)
+                log_warn "Отменено"
+                return
+                ;;
+        esac
     fi
 
     read -rp "  Порт [${DEFAULT_REPO_PORT}]: " inst_port
@@ -2531,9 +2590,24 @@ set_policy_mode() {
 
 validate_ip() {
     local ip="$1"
-    [[ "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] && return 0
-    [[ "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+/[0-9]+$ ]] && return 0
-    return 1
+    local addr mask
+    if [[ "$ip" == */* ]]; then
+        addr="${ip%/*}"
+        mask="${ip#*/}"
+        [[ "$mask" =~ ^[0-9]+$ ]] || return 1
+        (( mask >= 0 && mask <= 32 )) || return 1
+    else
+        addr="$ip"
+    fi
+    [[ "$addr" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+)\.([0-9]+)$ ]] || return 1
+    local i
+    for i in 1 2 3 4; do
+        local oct="${BASH_REMATCH[$i]}"
+        # Запрет ведущих нулей (кроме одиночного "0") и значений > 255
+        [[ "$oct" =~ ^0[0-9]+$ ]] && return 1
+        (( oct >= 0 && oct <= 255 )) || return 1
+    done
+    return 0
 }
 
 add_allowed_ip() {
@@ -2720,7 +2794,7 @@ do_access_menu() {
                 ;;
             2)
                 read -rp "  Подсеть (например 192.168.1.0/24): " subnet
-                if [[ "$subnet" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+/[0-9]+$ ]]; then
+                if [[ "$subnet" == */* ]] && validate_ip "$subnet"; then
                     add_allowed_ip "$subnet"
                     log_info "Подсеть $subnet добавлена"
                 else
@@ -3649,6 +3723,7 @@ do_help() {
     echo "    sudo ./crserver-manager.sh logs                    логи (последние 50)"
     echo "    sudo ./crserver-manager.sh backup                  создать бэкап"
     echo "    sudo ./crserver-manager.sh diagnose                диагностика"
+    echo "    sudo ./crserver-manager.sh healthcheck             одностроковый OK/FAIL для мониторинга"
     echo "    sudo ./crserver-manager.sh versions                список платформ"
     echo "    sudo ./crserver-manager.sh path-install/path-remove"
     echo ""
@@ -3782,13 +3857,41 @@ cli_instance() {
     shift || true
     case "$sub" in
         ""|list)
+            local _format="text"
+            if [[ "${1:-}" == "--json" ]]; then
+                _format="json"
+                shift
+            fi
             instance_list
+            local def n status_text mark ver port repo logd
+            def=$(instance_default)
+            if [[ "$_format" == "json" ]]; then
+                # Без зависимости от jq: собираем JSON вручную с экранированием.
+                # Имя инстанса валидировано, версия валидирована, порт — число,
+                # пути могут содержать кавычки/слэши, поэтому экранируем явно.
+                local _first=1 _esc_repo _esc_logd
+                printf '['
+                for n in "${INSTANCES[@]+"${INSTANCES[@]}"}"; do
+                    status_text=$(instance_status "$n")
+                    ver=$(awk -F'"' '/^VERSION=/   {print $2; exit}' "${INSTANCES_DIR}/${n}.conf" 2>/dev/null || true)
+                    port=$(awk -F'"' '/^REPO_PORT=/ {print $2; exit}' "${INSTANCES_DIR}/${n}.conf" 2>/dev/null || true)
+                    repo=$(awk -F'"' '/^REPO_DIR=/  {print $2; exit}' "${INSTANCES_DIR}/${n}.conf" 2>/dev/null || true)
+                    logd=$(awk -F'"' '/^LOG_DIR=/   {print $2; exit}' "${INSTANCES_DIR}/${n}.conf" 2>/dev/null || true)
+                    _esc_repo=${repo//\\/\\\\}; _esc_repo=${_esc_repo//\"/\\\"}
+                    _esc_logd=${logd//\\/\\\\}; _esc_logd=${_esc_logd//\"/\\\"}
+                    [[ $_first -eq 0 ]] && printf ','
+                    _first=0
+                    printf '{"name":"%s","status":"%s","version":"%s","port":%s,"repo_dir":"%s","log_dir":"%s","is_default":%s}' \
+                        "$n" "$status_text" "${ver:-}" "${port:-0}" "$_esc_repo" "$_esc_logd" \
+                        "$([[ "$n" == "$def" ]] && echo true || echo false)"
+                done
+                printf ']\n'
+                return 0
+            fi
             if [[ ${#INSTANCES[@]} -eq 0 ]]; then
                 echo "(инстансов нет)"
                 return 0
             fi
-            local def n status_text mark ver port
-            def=$(instance_default)
             printf "%-20s %-10s %-12s %-6s  %s\n" "NAME" "STATUS" "VERSION" "PORT" "REPO_DIR"
             for n in "${INSTANCES[@]}"; do
                 status_text=$(instance_status "$n")
@@ -3825,6 +3928,7 @@ cli_instance() {
                     *) log_error "Неизвестный аргумент: $1"; return 1 ;;
                 esac
             done
+            # Версия: либо передана, либо есть единственная установленная.
             if [[ -z "$ver" ]]; then
                 get_installed_versions
                 if [[ ${#INSTALLED_VERSIONS[@]} -ne 1 ]]; then
@@ -3833,9 +3937,48 @@ cli_instance() {
                 fi
                 ver="${INSTALLED_VERSIONS[0]}"
             fi
+            if ! version_name_valid "$ver"; then
+                log_error "Некорректная версия: '${ver}' (ожидается 8.3.NN.NNNN)"
+                return 1
+            fi
+            get_installed_versions
+            local _v _ver_ok=0
+            for _v in "${INSTALLED_VERSIONS[@]+"${INSTALLED_VERSIONS[@]}"}"; do
+                [[ "$_v" == "$ver" ]] && _ver_ok=1
+            done
+            if (( _ver_ok == 0 )); then
+                log_error "Версия ${ver} не установлена. Доступные: ${INSTALLED_VERSIONS[*]:-(нет)}"
+                return 1
+            fi
+
+            # Порт
             port="${port:-$DEFAULT_REPO_PORT}"
+            if ! [[ "$port" =~ ^[0-9]+$ ]] || (( port < 1 || port > 65535 )); then
+                log_error "Некорректный порт: '${port}'"
+                return 1
+            fi
+            # Коллизия с другими инстансами
+            local _n _existing_port
+            instance_list
+            for _n in "${INSTANCES[@]+"${INSTANCES[@]}"}"; do
+                _existing_port=$(awk -F'"' '/^REPO_PORT=/ {print $2; exit}' "${INSTANCES_DIR}/${_n}.conf" 2>/dev/null || true)
+                if [[ "$_existing_port" == "$port" ]]; then
+                    log_error "Порт ${port} уже используется инстансом ${_n}"
+                    return 1
+                fi
+            done
+
+            # Пути: только абсолютные, без переноса строк
             repo="${repo:-${REPO_BASE}/repo-${name}}"
             logd="${logd:-${LOG_BASE}/${name}}"
+            local _p
+            for _p in "$repo" "$logd"; do
+                if [[ -z "$_p" || "$_p" != /* || "$_p" == *$'\n'* ]]; then
+                    log_error "Некорректный путь: '${_p}' (нужен абсолютный путь без переносов)"
+                    return 1
+                fi
+            done
+
             INST_VERSION="$ver"
             INST_PORT="$port"
             INST_REPO_DIR="$repo"
@@ -3959,6 +4102,22 @@ cli_run_on_instance() {
             ;;
         diagnose)
             do_diagnose
+            ;;
+        healthcheck)
+            # Минималистичная проверка для мониторинга/systemd ExecStartPost.
+            # exit 0 — служба активна И порт слушается. Иначе exit 1.
+            # Без декорирования (NO_COLOR не нужен — выводим в одну строку).
+            local _u="crserver@${INST_NAME}.service"
+            if ! systemctl is-active --quiet "$_u" 2>/dev/null; then
+                echo "FAIL ${INST_NAME}: service not active"
+                return 1
+            fi
+            if ! ss -tlnH 2>/dev/null | awk -v p=":${INST_PORT}" '$4 ~ p"$" {found=1} END {exit !found}'; then
+                echo "FAIL ${INST_NAME}: port ${INST_PORT} not listening"
+                return 1
+            fi
+            echo "OK ${INST_NAME}: active on :${INST_PORT}"
+            return 0
             ;;
         repo)
             local subcmd="${1:-list}"
@@ -4253,7 +4412,7 @@ unset __args __i
 case "${1:-}" in
     install)       do_full_install ;;
     uninstall)     do_full_uninstall ;;
-    start|stop|restart|status|logs|backup|diagnose)
+    start|stop|restart|status|logs|backup|diagnose|healthcheck)
         cli_run_on_instance "$1"
         ;;
     repo|repos)
