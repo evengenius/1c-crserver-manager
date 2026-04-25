@@ -5,40 +5,60 @@ set -euo pipefail
 #  crserver-manager.sh — Управление сервером хранилища конфигураций 1С
 #  Debian 12 / Ubuntu 22.04+
 #
-#  Использование:
-#    sudo ./crserver-manager.sh              — интерактивное меню
-#    sudo ./crserver-manager.sh install      — установка
-#    sudo ./crserver-manager.sh status       — статус
-#    sudo ./crserver-manager.sh help         — справка
+#  v2.0.0 — мульти-инстанс архитектура
 #
-#  Структура каталога пакетов (packages/ рядом со скриптом):
-#    packages/
-#    ├── 8.3.25.1560/
-#    │   ├── 1c-enterprise-8.3.25.1560-common_*.deb
-#    │   ├── 1c-enterprise-8.3.25.1560-server_*.deb
-#    │   ├── 1c-enterprise-8.3.25.1560-ws_*.deb
-#    │   └── 1c-enterprise-8.3.25.1560-crs_*.deb
-#    ├── 8.3.26.XXXX/
-#    │   └── ...
+#  ОСНОВНЫЕ ИДЕИ:
+#    * Один systemd-template /etc/systemd/system/crserver@.service
+#      запускает несколько независимых инстансов crserver@<имя>.
+#    * Каждый инстанс — отдельный конфиг /etc/1c-crserver/instances/<имя>.conf
+#      со своими VERSION, REPO_DIR, REPO_PORT, LOG_DIR.
+#    * Платформенные версии устанавливаются глобально в /opt/1cv8/x86_64/...
+#      Несколько инстансов могут использовать одну и ту же версию.
+#    * Файрвол: одна общая цепочка CRSERVER (глобальный whitelist) +
+#      опциональные пер-инстанс цепочки CRSERVER-<имя> для тонких ACL.
+#    * Бэкапы — общая директория /var/1c/backup. Имена включают имя инстанса.
+#    * Файл /etc/1c-crserver/default-instance — указатель на инстанс по
+#      умолчанию, используется при `crserver start|stop|backup|...` без -i.
+#    * Миграция из v1.x: обнаружение старого crserver.service делается
+#      пассивно; миграция запускается ТОЛЬКО через пункт меню «Инстансы».
+#
+#  Использование:
+#    sudo ./crserver-manager.sh                       — интерактивное меню
+#    sudo ./crserver-manager.sh install               — первичная установка
+#    sudo ./crserver-manager.sh -i prod25 start       — на конкретном инстансе
+#    sudo ./crserver-manager.sh instance list         — список инстансов
+#    sudo ./crserver-manager.sh help                  — полная справка
 # ============================================================================
 
 # --- Версия скрипта ---
 # При выпуске новой версии увеличить и закоммитить в репозиторий.
 # Используется для проверки обновлений (см. do_self_update).
-SCRIPT_VERSION="1.4.0"
+SCRIPT_VERSION="2.0.0"
 
 # --- Источник обновлений ---
 UPDATE_REPO="evengenius/1c-crserver-manager"
 UPDATE_BRANCH="main"
 UPDATE_URL="https://raw.githubusercontent.com/${UPDATE_REPO}/${UPDATE_BRANCH}/crserver-manager.sh"
 
-# --- Конфигурация ---
-CONFIG_FILE="/etc/1c-crserver/crserver.conf"
-DEFAULT_REPO_DIR="/var/1c/repo"
+# --- Конфигурация / пути ---
+ETC_DIR="/etc/1c-crserver"
+INSTANCES_DIR="${ETC_DIR}/instances"
+DEFAULT_INSTANCE_FILE="${ETC_DIR}/default-instance"
+LEGACY_CONFIG_FILE="${ETC_DIR}/crserver.conf"
+LEGACY_SERVICE_FILE="/etc/systemd/system/crserver.service"
+SERVICE_TEMPLATE_FILE="/etc/systemd/system/crserver@.service"
+
+# Дефолты для НОВЫХ инстансов
 DEFAULT_REPO_PORT=1542
-DEFAULT_LOG_DIR="/var/log/1c/crserver"
 DEFAULT_BACKUP_DIR="/var/1c/backup"
-SERVICE_NAME="crserver"
+
+# Базовый префикс пути хранилищ/логов: /var/1c/repo-<name>, /var/log/1c/<name>
+REPO_BASE="/var/1c"
+LOG_BASE="/var/log/1c"
+
+# Бэкап-каталог общий, поэтому константа
+BACKUP_DIR="${DEFAULT_BACKUP_DIR}"
+
 IPTABLES_CHAIN="CRSERVER"
 PACKAGES_DIR_NAME="packages"
 
@@ -61,6 +81,14 @@ log_warn()  { echo -e "${YELLOW}[!]${NC} $1"; }
 log_error() { echo -e "${RED}[✗]${NC} $1"; }
 log_step()  { echo -e "${CYAN}[→]${NC} $1"; }
 
+# --- Контекст текущего инстанса (заполняется select_instance / instance_load) ---
+SELECTED_INSTANCE=""
+INST_NAME=""
+INST_VERSION=""
+INST_PORT=""
+INST_REPO_DIR=""
+INST_LOG_DIR=""
+
 # --- Проверка root ---
 check_root() {
     if [[ $EUID -ne 0 ]]; then
@@ -70,91 +98,257 @@ check_root() {
 }
 
 # ============================================================================
-#  КОНФИГУРАЦИЯ
+#  ИНСТАНСЫ — БАЗОВЫЕ ОПЕРАЦИИ
 # ============================================================================
 
-load_config() {
-    # Сбрасываем переменные, чтобы повторный вызов с пустым/изменённым конфигом
-    # не сохранял старые значения
-    REPO_DIR=""; REPO_PORT=""; LOG_DIR=""; BACKUP_DIR=""
+# Валидация имени: ^[a-z][a-z0-9-]{0,31}$
+instance_name_valid() {
+    local name="$1"
+    [[ -z "$name" ]] && return 1
+    [[ ${#name} -gt 32 ]] && return 1
+    [[ "$name" =~ ^[a-z][a-z0-9-]{0,31}$ ]] || return 1
+    return 0
+}
 
-    # Безопасный парсинг: только KEY="VALUE" из белого списка ключей
-    if [[ -f "$CONFIG_FILE" ]]; then
-        local line key val
-        while IFS= read -r line || [[ -n "$line" ]]; do
-            # Пропуск комментариев/пустых
-            [[ "$line" =~ ^[[:space:]]*# ]] && continue
-            [[ -z "${line//[[:space:]]/}" ]] && continue
-            # Формат KEY="value" или KEY=value (без подстановок)
-            if [[ "$line" =~ ^[[:space:]]*([A-Z_][A-Z0-9_]*)=\"?([^\"]*)\"?[[:space:]]*$ ]]; then
-                key="${BASH_REMATCH[1]}"
-                val="${BASH_REMATCH[2]}"
-                case "$key" in
-                    REPO_DIR|REPO_PORT|LOG_DIR|BACKUP_DIR)
-                        printf -v "$key" '%s' "$val"
-                        ;;
-                esac
-            fi
-        done < "$CONFIG_FILE"
+# Заполняет глобальный массив INSTANCES именами всех существующих инстансов.
+instance_list() {
+    INSTANCES=()
+    [[ -d "$INSTANCES_DIR" ]] || return 0
+    local f name
+    for f in "$INSTANCES_DIR"/*.conf; do
+        [[ -f "$f" ]] || continue
+        name=$(basename "$f" .conf)
+        instance_name_valid "$name" || continue
+        INSTANCES+=("$name")
+    done
+}
+
+instance_exists() {
+    local name="$1"
+    [[ -f "${INSTANCES_DIR}/${name}.conf" ]]
+}
+
+# Безопасный парсер: только KEY="VALUE" из белого списка ключей.
+# Заполняет INST_* и INST_NAME.
+instance_load() {
+    local name="$1"
+    local file="${INSTANCES_DIR}/${name}.conf"
+    INST_NAME="$name"
+    INST_VERSION=""
+    INST_PORT=""
+    INST_REPO_DIR=""
+    INST_LOG_DIR=""
+
+    if [[ ! -f "$file" ]]; then
+        log_error "Конфиг инстанса не найден: $file"
+        return 1
     fi
 
-    REPO_DIR="${REPO_DIR:-$DEFAULT_REPO_DIR}"
-    REPO_PORT="${REPO_PORT:-$DEFAULT_REPO_PORT}"
-    LOG_DIR="${LOG_DIR:-$DEFAULT_LOG_DIR}"
-    BACKUP_DIR="${BACKUP_DIR:-$DEFAULT_BACKUP_DIR}"
+    local line key val
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        [[ "$line" =~ ^[[:space:]]*# ]] && continue
+        [[ -z "${line//[[:space:]]/}" ]] && continue
+        if [[ "$line" =~ ^[[:space:]]*([A-Z_][A-Z0-9_]*)=\"?([^\"]*)\"?[[:space:]]*$ ]]; then
+            key="${BASH_REMATCH[1]}"
+            val="${BASH_REMATCH[2]}"
+            case "$key" in
+                NAME)      ;; # информационно, имя берём из файла
+                VERSION)   INST_VERSION="$val" ;;
+                REPO_PORT) INST_PORT="$val" ;;
+                REPO_DIR)  INST_REPO_DIR="$val" ;;
+                LOG_DIR)   INST_LOG_DIR="$val" ;;
+            esac
+        fi
+    done < "$file"
+
+    if [[ -z "$INST_VERSION" || -z "$INST_PORT" || -z "$INST_REPO_DIR" || -z "$INST_LOG_DIR" ]]; then
+        log_error "Конфиг инстанса '${name}' неполный (нужны VERSION, REPO_PORT, REPO_DIR, LOG_DIR)"
+        return 1
+    fi
+    return 0
 }
 
-save_config() {
-    mkdir -p "$(dirname "$CONFIG_FILE")"
-    cat > "$CONFIG_FILE" << EOF
-# Конфигурация сервера хранилища 1С
-REPO_DIR="$REPO_DIR"
-REPO_PORT="$REPO_PORT"
-LOG_DIR="$LOG_DIR"
-BACKUP_DIR="$BACKUP_DIR"
+# Сохраняет конфиг инстанса. Берёт значения из INST_*.
+instance_save() {
+    local name="$1"
+    if ! instance_name_valid "$name"; then
+        log_error "Недопустимое имя инстанса: '${name}'"
+        return 1
+    fi
+    if [[ -z "${INST_VERSION:-}" || -z "${INST_PORT:-}" || -z "${INST_REPO_DIR:-}" || -z "${INST_LOG_DIR:-}" ]]; then
+        log_error "instance_save: не заполнены INST_* (VERSION/PORT/REPO_DIR/LOG_DIR)"
+        return 1
+    fi
+    if ! [[ "$INST_PORT" =~ ^[0-9]+$ ]] || (( INST_PORT < 1 || INST_PORT > 65535 )); then
+        log_error "Некорректный порт: '${INST_PORT}'"
+        return 1
+    fi
+    local p
+    for p in "$INST_REPO_DIR" "$INST_LOG_DIR"; do
+        if [[ -z "$p" || "$p" != /* || "$p" == *$'\n'* ]]; then
+            log_error "Некорректный путь: '${p}' (ожидается абсолютный путь)"
+            return 1
+        fi
+    done
+
+    mkdir -p "$INSTANCES_DIR"
+    local file="${INSTANCES_DIR}/${name}.conf"
+    cat > "$file" << EOF
+# Конфигурация инстанса сервера хранилища 1С
+# Файл читается systemd через EnvironmentFile=, поэтому имена совпадают
+# с переменными окружения, ожидаемыми ExecStart-обёрткой.
+NAME="${name}"
+VERSION="${INST_VERSION}"
+REPO_DIR="${INST_REPO_DIR}"
+REPO_PORT="${INST_PORT}"
+LOG_DIR="${INST_LOG_DIR}"
 EOF
-    log_info "Конфигурация сохранена: $CONFIG_FILE"
+    chmod 644 "$file"
+    return 0
 }
 
-# ============================================================================
-#  ОПРЕДЕЛЕНИЕ ПЛАТФОРМЫ И ВЕРСИЙ
-# ============================================================================
+# Возвращает строку "running"|"stopped"|"failed"|"phantom".
+# phantom = в конфиге указана версия, бинарника которой нет в системе.
+instance_status() {
+    local name="$1"
+    if ! instance_exists "$name"; then
+        echo "missing"
+        return 0
+    fi
+    local ver bin
+    ver=$(awk -F'"' '/^VERSION=/ {print $2; exit}' "${INSTANCES_DIR}/${name}.conf" 2>/dev/null || true)
+    bin="/opt/1cv8/x86_64/${ver}/crserver"
+    if [[ -n "$ver" && ! -f "$bin" ]]; then
+        echo "phantom"
+        return 0
+    fi
+    local active
+    active=$(systemctl is-active "crserver@${name}.service" 2>/dev/null || true)
+    case "$active" in
+        active)        echo "running" ;;
+        failed)        echo "failed" ;;
+        *)             echo "stopped" ;;
+    esac
+}
 
-# Определяет активную версию (из systemd-службы).
-# Выставляет:
-#   ACTIVE_VERSION         — строка версии "8.3.X.Y" или ""
-#   ACTIVE_CRSERVER_BIN    — путь к бинарнику из ExecStart
-#   ACTIVE_VERSION_PHANTOM — 1 если в юните указана версия, бинарника которой нет
-detect_active_version() {
-    ACTIVE_VERSION=""
-    ACTIVE_CRSERVER_BIN=""
-    ACTIVE_VERSION_PHANTOM=0
-
-    if [[ -f /etc/systemd/system/${SERVICE_NAME}.service ]]; then
-        local exec_line
-        exec_line=$(grep "^ExecStart=" /etc/systemd/system/${SERVICE_NAME}.service 2>/dev/null || true)
-        if [[ -n "$exec_line" ]]; then
-            ACTIVE_CRSERVER_BIN=$(echo "$exec_line" | sed 's/^ExecStart=//' | awk '{print $1}')
-            ACTIVE_VERSION=$(echo "$ACTIVE_CRSERVER_BIN" | grep -oP '8\.3\.\d+\.\d+' || true)
-            # Фантом: юнит ссылается на удалённый бинарник
-            if [[ -n "$ACTIVE_CRSERVER_BIN" && ! -f "$ACTIVE_CRSERVER_BIN" ]]; then
-                ACTIVE_VERSION_PHANTOM=1
-            fi
+# Имя инстанса по умолчанию.
+# 1. Если задан /etc/1c-crserver/default-instance — берём оттуда (если такой инстанс существует).
+# 2. Иначе если ровно один инстанс — он и есть дефолт.
+# 3. Иначе — пусто.
+instance_default() {
+    if [[ -f "$DEFAULT_INSTANCE_FILE" ]]; then
+        local name
+        name=$(head -1 "$DEFAULT_INSTANCE_FILE" 2>/dev/null | tr -d '[:space:]' || true)
+        if [[ -n "$name" ]] && instance_exists "$name"; then
+            echo "$name"
+            return 0
         fi
     fi
-
-    # Фоллбэк: ищем любой установленный crserver
-    if [[ -z "$ACTIVE_VERSION" ]] && [[ -d /opt/1cv8/x86_64 ]]; then
-        for dir in /opt/1cv8/x86_64/*/; do
-            if [[ -f "${dir}crserver" ]]; then
-                ACTIVE_CRSERVER_BIN="${dir}crserver"
-                ACTIVE_VERSION=$(basename "$dir")
-                ACTIVE_VERSION_PHANTOM=0
-                break
-            fi
-        done
+    instance_list
+    if [[ ${#INSTANCES[@]} -eq 1 ]]; then
+        echo "${INSTANCES[0]}"
+        return 0
     fi
+    echo ""
+    return 0
 }
+
+instance_set_default() {
+    local name="$1"
+    if ! instance_exists "$name"; then
+        log_error "Инстанс не существует: ${name}"
+        return 1
+    fi
+    mkdir -p "$ETC_DIR"
+    printf '%s\n' "$name" > "$DEFAULT_INSTANCE_FILE"
+    chmod 644 "$DEFAULT_INSTANCE_FILE"
+    return 0
+}
+
+# Интерактивный выбор инстанса. Заполняет SELECTED_INSTANCE.
+# Если инстансов нет — ошибка. Если один — выбирает молча. Если несколько —
+# подсказывает дефолтный (если есть), иначе спрашивает.
+select_instance_interactive() {
+    SELECTED_INSTANCE=""
+    instance_list
+    if [[ ${#INSTANCES[@]} -eq 0 ]]; then
+        log_error "Нет ни одного инстанса. Создайте через меню «Инстансы» → «Создать»."
+        return 1
+    fi
+    if [[ ${#INSTANCES[@]} -eq 1 ]]; then
+        SELECTED_INSTANCE="${INSTANCES[0]}"
+        return 0
+    fi
+    local def
+    def=$(instance_default)
+    echo ""
+    echo "  Выберите инстанс:"
+    local idx=0 n status_text mark
+    for n in "${INSTANCES[@]}"; do
+        idx=$((idx + 1))
+        status_text=$(instance_status "$n")
+        mark=""
+        [[ "$n" == "$def" ]] && mark="  ${CYAN}(по умолчанию)${NC}"
+        echo -e "    ${idx}) ${n}  [${status_text}]${mark}"
+    done
+    echo ""
+    local prompt_def=""
+    [[ -n "$def" ]] && prompt_def=" [Enter — ${def}]"
+    read -rp "  Номер${prompt_def} (или 0 для отмены): " num
+    if [[ "$num" == "0" ]]; then
+        return 1
+    fi
+    if [[ -z "$num" && -n "$def" ]]; then
+        SELECTED_INSTANCE="$def"
+        return 0
+    fi
+    if [[ "$num" =~ ^[0-9]+$ ]] && (( num >= 1 && num <= ${#INSTANCES[@]} )); then
+        SELECTED_INSTANCE="${INSTANCES[$((num - 1))]}"
+        return 0
+    fi
+    log_error "Неверный номер"
+    return 1
+}
+
+# Утилита: выбрать инстанс и сразу загрузить его в INST_*.
+require_instance() {
+    select_instance_interactive || return 1
+    instance_load "$SELECTED_INSTANCE" || return 1
+    return 0
+}
+
+# Выбор инстанса для CLI-режима. Учитывает CLI_INSTANCE (от `-i name`).
+# Если CLI_INSTANCE задан — используем. Иначе берём дефолт.
+# Если дефолта нет и инстансов >1 — ошибка с подсказкой.
+cli_select_instance() {
+    SELECTED_INSTANCE=""
+    if [[ -n "${CLI_INSTANCE:-}" ]]; then
+        if ! instance_exists "$CLI_INSTANCE"; then
+            log_error "Инстанс не найден: ${CLI_INSTANCE}"
+            return 1
+        fi
+        SELECTED_INSTANCE="$CLI_INSTANCE"
+        return 0
+    fi
+    instance_list
+    if [[ ${#INSTANCES[@]} -eq 0 ]]; then
+        log_error "Ни одного инстанса не настроено. Запустите интерактивное меню для создания."
+        return 1
+    fi
+    local def
+    def=$(instance_default)
+    if [[ -n "$def" ]]; then
+        SELECTED_INSTANCE="$def"
+        return 0
+    fi
+    log_error "Несколько инстансов и не задан дефолтный. Используйте: $0 -i <имя> <команда>"
+    echo "  Доступные инстансы: ${INSTANCES[*]}" >&2
+    return 1
+}
+
+# ============================================================================
+#  ОПРЕДЕЛЕНИЕ ПЛАТФОРМЫ И ВЕРСИЙ (глобально, не зависит от инстансов)
+# ============================================================================
 
 # Возвращает массив установленных версий (у которых есть crserver)
 get_installed_versions() {
@@ -176,20 +370,16 @@ get_available_versions() {
         for dir in "$PACKAGES_DIR"/*/; do
             [[ -d "$dir" ]] || continue
             ver=$(basename "$dir")
-            # Проверяем что внутри есть хотя бы crs-пакет
             crs_match=$(find "$dir" -maxdepth 1 -name '1c-enterprise-*-crs_*.deb' ! -name '*-nls*' 2>/dev/null | head -1)
             [[ -n "$crs_match" ]] && AVAILABLE_VERSIONS+=("$ver")
         done
     fi
 }
 
-# Проверяет наличие 4 пакетов в каталоге версии
 validate_version_packages() {
     local ver="$1"
     local dir="${PACKAGES_DIR}/${ver}"
-
     [[ -d "$dir" ]] || return 1
-
     local kind found
     for kind in common server ws crs; do
         found=$(find "$dir" -maxdepth 1 -name "1c-enterprise-*-${kind}_*.deb" ! -name '*-nls*' 2>/dev/null | head -1)
@@ -198,7 +388,6 @@ validate_version_packages() {
     return 0
 }
 
-# Определяем пользователя и группу 1С
 detect_1c_user() {
     SVC_USER="usr1cv8"
     SVC_GROUP=""
@@ -207,7 +396,6 @@ detect_1c_user() {
     fi
 }
 
-# Возвращает основной IP-адрес сервера (или "127.0.0.1" если не удалось)
 get_primary_ip() {
     local ip
     ip=$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src"){print $(i+1); exit}}')
@@ -217,86 +405,303 @@ get_primary_ip() {
     echo "${ip:-127.0.0.1}"
 }
 
-# Однократная проверка целостности активной версии за сессию.
-# Если в systemd-юните указана версия с удалённым бинарником — предлагает
-# автоматически переключиться на установленную (если такая есть).
-PHANTOM_CHECK_DONE=0
-check_and_offer_phantom_fix() {
-    [[ "$PHANTOM_CHECK_DONE" -eq 1 ]] && return 0
-    [[ "$ACTIVE_VERSION_PHANTOM" -ne 1 ]] && { PHANTOM_CHECK_DONE=1; return 0; }
+# ============================================================================
+#  SYSTEMD TEMPLATE
+# ============================================================================
 
-    # Нашли проблему — показываем один раз
-    echo ""
-    log_warn "ОБНАРУЖЕНА ПРОБЛЕМА: активная версия в systemd-юните — фантом"
-    echo "    Юнит:     /etc/systemd/system/${SERVICE_NAME}.service"
-    echo "    Указана:  ${ACTIVE_VERSION}"
-    echo "    Бинарник: ${ACTIVE_CRSERVER_BIN} — НЕ СУЩЕСТВУЕТ"
-
-    if [[ ${#INSTALLED_VERSIONS[@]} -eq 0 ]]; then
-        log_warn "  Установленных версий нет — установите версию через меню."
-        echo ""
-        read -rp "  Нажмите Enter..." _
-        PHANTOM_CHECK_DONE=1
+# Создаёт /etc/systemd/system/crserver@.service, если его ещё нет.
+# Если уже есть — НИЧЕГО не делает (политика: не перезаписываем без явной команды).
+generate_systemd_template() {
+    if [[ -f "$SERVICE_TEMPLATE_FILE" ]]; then
         return 0
     fi
+    detect_1c_user
+    local svc_user="${SVC_USER:-usr1cv8}"
+    local svc_group="${SVC_GROUP:-grp1cv8}"
 
-    local target="${INSTALLED_VERSIONS[0]}"
-    echo "    Доступна: ${target}"
-    echo ""
-    read -rp "  Переключить службу на ${target} сейчас? (Y/n): " ans
-    PHANTOM_CHECK_DONE=1
-    if [[ "$ans" =~ ^[Nn]$ ]]; then
-        log_warn "Пропущено. Переключите вручную через меню «Управление версиями»."
-        sleep 1
-        return 0
-    fi
+    # Замечание про ProtectSystem=full (а не strict): systemd не раскрывает
+    # ${VAR} в директиве ReadWritePaths, и пути инстансов разные. Поэтому
+    # используем менее жёсткий full (запись в /var/* разрешена), а наши
+    # каталоги все под /var/. ExecStart обернут в /bin/sh -c, чтобы systemd
+    # не пытался запустить /opt/.../${VERSION}/crserver буквально.
+    cat > "$SERVICE_TEMPLATE_FILE" << EOF
+[Unit]
+Description=1C:Enterprise Configuration Repository Server (instance %i)
+Documentation=https://its.1c.ru
+After=network.target
 
-    switch_to_version "$target"
-    # Перечитываем состояние после фикса
-    detect_active_version
-    get_installed_versions
-    read -rp "  Нажмите Enter..." _
+[Service]
+Type=simple
+EnvironmentFile=/etc/1c-crserver/instances/%i.conf
+User=${svc_user}
+Group=${svc_group}
+
+ExecStartPre=/bin/sh -c 'mkdir -p "\${REPO_DIR}" "\${LOG_DIR}"; chown -R ${svc_user}:${svc_group} "\${REPO_DIR}" "\${LOG_DIR}"'
+ExecStart=/bin/sh -c '/opt/1cv8/x86_64/\${VERSION}/crserver -d \${REPO_DIR} -port \${REPO_PORT}'
+
+Restart=on-failure
+RestartSec=10
+TimeoutStopSec=30
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=crserver-%i
+
+NoNewPrivileges=yes
+ProtectSystem=full
+ProtectHome=yes
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    chmod 644 "$SERVICE_TEMPLATE_FILE"
+    systemctl daemon-reload || log_warn "systemctl daemon-reload завершился с ошибкой"
+    return 0
+}
+
+# Принудительно регенерирует template (используется при миграции / ремонте).
+regenerate_systemd_template() {
+    rm -f "$SERVICE_TEMPLATE_FILE"
+    generate_systemd_template
 }
 
 # ============================================================================
-#  УПРАВЛЕНИЕ ВЕРСИЯМИ — МЕНЮ
+#  ОПРЕДЕЛЕНИЕ ЛЕГАСИ-УСТАНОВКИ И МИГРАЦИЯ
+# ============================================================================
+
+# Заполняет LEGACY_VERSION/LEGACY_PORT/LEGACY_REPO_DIR/LEGACY_LOG_DIR/LEGACY_BIN.
+# Возвращает 0 — старая установка обнаружена, 1 — нет.
+get_legacy_install() {
+    LEGACY_VERSION=""
+    LEGACY_PORT=""
+    LEGACY_REPO_DIR=""
+    LEGACY_LOG_DIR=""
+    LEGACY_BIN=""
+
+    if [[ ! -f "$LEGACY_SERVICE_FILE" ]]; then
+        return 1
+    fi
+
+    local exec_line
+    exec_line=$(grep "^ExecStart=" "$LEGACY_SERVICE_FILE" 2>/dev/null || true)
+    if [[ -n "$exec_line" ]]; then
+        LEGACY_BIN=$(echo "$exec_line" | sed 's/^ExecStart=//' | awk '{print $1}')
+        LEGACY_VERSION=$(echo "$LEGACY_BIN" | grep -oP '8\.3\.\d+\.\d+' || true)
+        # -port из строки ExecStart
+        LEGACY_PORT=$(echo "$exec_line" | grep -oP -- '-port[ =]+\K[0-9]+' | head -1 || true)
+        LEGACY_REPO_DIR=$(echo "$exec_line" | grep -oP -- '-d[ =]+\K[^ ]+' | head -1 || true)
+    fi
+
+    if [[ -f "$LEGACY_CONFIG_FILE" ]]; then
+        local line key val
+        while IFS= read -r line || [[ -n "$line" ]]; do
+            [[ "$line" =~ ^[[:space:]]*# ]] && continue
+            [[ -z "${line//[[:space:]]/}" ]] && continue
+            if [[ "$line" =~ ^[[:space:]]*([A-Z_][A-Z0-9_]*)=\"?([^\"]*)\"?[[:space:]]*$ ]]; then
+                key="${BASH_REMATCH[1]}"
+                val="${BASH_REMATCH[2]}"
+                case "$key" in
+                    REPO_DIR)  [[ -z "$LEGACY_REPO_DIR" ]] && LEGACY_REPO_DIR="$val" ;;
+                    REPO_PORT) [[ -z "$LEGACY_PORT" ]]     && LEGACY_PORT="$val" ;;
+                    LOG_DIR)   LEGACY_LOG_DIR="$val" ;;
+                esac
+            fi
+        done < "$LEGACY_CONFIG_FILE"
+    fi
+
+    LEGACY_REPO_DIR="${LEGACY_REPO_DIR:-/var/1c/repo}"
+    LEGACY_PORT="${LEGACY_PORT:-1542}"
+    LEGACY_LOG_DIR="${LEGACY_LOG_DIR:-/var/log/1c/crserver}"
+    return 0
+}
+
+# Перенос каталога с откатом при ошибке.
+# $1 — src, $2 — dst. Использует mv в пределах одной FS, иначе rsync/cp -a.
+move_dir_safe() {
+    local src="$1" dst="$2"
+    if [[ ! -d "$src" ]]; then
+        return 0
+    fi
+    if [[ -e "$dst" ]]; then
+        log_error "Целевой путь уже существует: $dst"
+        return 1
+    fi
+    mkdir -p "$(dirname "$dst")"
+    # Пробуем mv (быстро если та же FS)
+    if mv "$src" "$dst" 2>/dev/null; then
+        return 0
+    fi
+    # Иначе копируем и удаляем
+    log_step "Копирование ${src} → ${dst} (другая ФС)..."
+    if command -v rsync >/dev/null 2>&1; then
+        if ! rsync -aHAX "${src}/" "${dst}/"; then
+            log_error "rsync не удался"
+            rm -rf "$dst"
+            return 1
+        fi
+    else
+        if ! cp -a "$src" "$dst"; then
+            log_error "cp -a не удался"
+            rm -rf "$dst"
+            return 1
+        fi
+    fi
+    rm -rf "$src" || log_warn "Не удалось удалить исходный каталог: $src"
+    return 0
+}
+
+migrate_legacy() {
+    if ! get_legacy_install; then
+        log_warn "Старая установка не обнаружена (нет ${LEGACY_SERVICE_FILE})"
+        return 0
+    fi
+
+    echo ""
+    echo -e "${BOLD}══════════════════════════════════════════════════${NC}"
+    echo -e "${BOLD}  Миграция v1.x → v2.0 (мульти-инстанс)${NC}"
+    echo -e "${BOLD}══════════════════════════════════════════════════${NC}"
+    echo ""
+    echo "  Обнаружена старая установка:"
+    echo "    Юнит:        ${LEGACY_SERVICE_FILE}"
+    echo "    Версия:      ${LEGACY_VERSION:-?}"
+    echo "    Бинарник:    ${LEGACY_BIN:-?}"
+    echo "    Порт:        ${LEGACY_PORT}"
+    echo "    Хранилища:   ${LEGACY_REPO_DIR}"
+    echo "    Логи:        ${LEGACY_LOG_DIR}"
+    echo ""
+    echo "  Будет выполнено:"
+    echo "    1. Остановка и удаление crserver.service"
+    echo "    2. Перенос ${LEGACY_REPO_DIR} → /var/1c/repo-<имя>"
+    echo "    3. Перенос ${LEGACY_LOG_DIR} → /var/log/1c/<имя>"
+    echo "    4. Создание /etc/1c-crserver/instances/<имя>.conf"
+    echo "    5. Установка crserver@<имя> как инстанса по умолчанию"
+    echo "    6. Сохранение старого crserver.conf как .legacy для подстраховки"
+    echo ""
+    read -rp "  Имя инстанса [default]: " new_name
+    new_name="${new_name:-default}"
+    if ! instance_name_valid "$new_name"; then
+        log_error "Недопустимое имя: '${new_name}' (нужно ^[a-z][a-z0-9-]{0,31}$)"
+        return 1
+    fi
+    if instance_exists "$new_name"; then
+        log_error "Инстанс с таким именем уже существует: ${new_name}"
+        return 1
+    fi
+
+    if [[ -z "$LEGACY_VERSION" ]]; then
+        log_error "Не удалось определить версию из старого юнита. Прерываю."
+        return 1
+    fi
+
+    echo ""
+    read -rp "  Подтвердить миграцию? (Y/n): " ans
+    if [[ "$ans" =~ ^[Nn]$ ]]; then
+        log_warn "Миграция отменена"
+        return 0
+    fi
+
+    log_step "Остановка старой службы..."
+    systemctl stop crserver.service 2>/dev/null || true
+    systemctl disable crserver.service 2>/dev/null || true
+
+    local new_repo_dir="${REPO_BASE}/repo-${new_name}"
+    local new_log_dir="${LOG_BASE}/${new_name}"
+
+    # Если репо-директория уже совпадает с целевой — пропускаем перенос.
+    if [[ "$LEGACY_REPO_DIR" != "$new_repo_dir" ]]; then
+        log_step "Перенос каталога хранилищ..."
+        if ! move_dir_safe "$LEGACY_REPO_DIR" "$new_repo_dir"; then
+            log_error "Перенос хранилищ не удался — миграция прервана"
+            return 1
+        fi
+    else
+        log_info "Каталог хранилищ уже на месте: ${new_repo_dir}"
+        mkdir -p "$new_repo_dir"
+    fi
+
+    if [[ -d "$LEGACY_LOG_DIR" && "$LEGACY_LOG_DIR" != "$new_log_dir" ]]; then
+        log_step "Перенос каталога логов..."
+        move_dir_safe "$LEGACY_LOG_DIR" "$new_log_dir" || \
+            log_warn "Не удалось перенести логи (продолжаем)"
+    fi
+    mkdir -p "$new_log_dir"
+
+    detect_1c_user
+    if [[ -n "${SVC_USER:-}" && -n "${SVC_GROUP:-}" ]]; then
+        chown -R "${SVC_USER}:${SVC_GROUP}" "$new_repo_dir" "$new_log_dir" 2>/dev/null || true
+    fi
+
+    log_step "Создание конфига инстанса..."
+    INST_VERSION="$LEGACY_VERSION"
+    INST_PORT="$LEGACY_PORT"
+    INST_REPO_DIR="$new_repo_dir"
+    INST_LOG_DIR="$new_log_dir"
+    if ! instance_save "$new_name"; then
+        log_error "Не удалось сохранить конфиг инстанса"
+        return 1
+    fi
+
+    log_step "Удаление старого юнита..."
+    rm -f "$LEGACY_SERVICE_FILE"
+
+    log_step "Архивация старого crserver.conf..."
+    if [[ -f "$LEGACY_CONFIG_FILE" ]]; then
+        mv -f "$LEGACY_CONFIG_FILE" "${LEGACY_CONFIG_FILE}.legacy" || \
+            log_warn "Не удалось переименовать ${LEGACY_CONFIG_FILE}"
+    fi
+
+    log_step "Генерация systemd-template..."
+    generate_systemd_template
+    systemctl daemon-reload
+
+    log_step "Запуск crserver@${new_name}..."
+    if systemctl enable "crserver@${new_name}.service" >/dev/null 2>&1; then
+        log_info "enabled: crserver@${new_name}"
+    else
+        log_warn "systemctl enable вернул ошибку"
+    fi
+    if systemctl start "crserver@${new_name}.service"; then
+        log_info "Инстанс ${new_name} запущен"
+    else
+        log_error "Не удалось запустить crserver@${new_name}"
+        echo "  Лог: journalctl -u crserver@${new_name} -n 50"
+    fi
+
+    instance_set_default "$new_name"
+    log_info "Установлен по умолчанию: ${new_name}"
+
+    # Файрвол: убираем INPUT-правило старого порта, добавляем для нового
+    setup_firewall_chain
+    add_input_for_port "$INST_PORT"
+
+    echo ""
+    log_info "Миграция завершена"
+    echo ""
+    return 0
+}
+
+# ============================================================================
+#  УПРАВЛЕНИЕ ПЛАТФОРМЕННЫМИ ВЕРСИЯМИ — МЕНЮ
 # ============================================================================
 
 do_version_menu() {
     while true; do
-        detect_active_version
         get_installed_versions
         get_available_versions
 
         echo ""
         echo -e "${BOLD}══════════════════════════════════════════════════${NC}"
-        echo -e "  Управление версиями"
+        echo -e "  Управление версиями платформы 1С"
         echo -e "${BOLD}══════════════════════════════════════════════════${NC}"
         echo ""
 
-        # Активная версия
-        echo -n "  Активная версия:  "
-        if [[ -n "$ACTIVE_VERSION" ]]; then
-            if [[ "$ACTIVE_VERSION_PHANTOM" -eq 1 ]]; then
-                echo -e "${RED}${ACTIVE_VERSION} (фантом — бинарник удалён)${NC}"
-            else
-                echo -e "${GREEN}${ACTIVE_VERSION}${NC}"
-            fi
-        else
-            echo -e "${YELLOW}не установлена${NC}"
-        fi
-
-        # Установленные
         echo -n "  Установленные:    "
         if [[ ${#INSTALLED_VERSIONS[@]} -gt 0 ]]; then
-            local first=1
+            local first=1 v
             for v in "${INSTALLED_VERSIONS[@]}"; do
                 [[ $first -eq 0 ]] && echo -n ", "
-                if [[ "$v" == "$ACTIVE_VERSION" && "$ACTIVE_VERSION_PHANTOM" -eq 0 ]]; then
-                    echo -ne "${GREEN}${v}${NC} ◄"
-                else
-                    echo -n "$v"
-                fi
+                echo -n "$v"
                 first=0
             done
             echo ""
@@ -304,15 +709,13 @@ do_version_menu() {
             echo "(нет)"
         fi
 
-        # Доступные пакеты
         echo -n "  Пакеты (packages/): "
         if [[ ${#AVAILABLE_VERSIONS[@]} -gt 0 ]]; then
-            local first=1
+            local first=1 v installed iv
             for v in "${AVAILABLE_VERSIONS[@]}"; do
                 [[ $first -eq 0 ]] && echo -n ", "
-                # Помечаем уже установленные
-                local installed=0
-                for iv in "${INSTALLED_VERSIONS[@]}"; do
+                installed=0
+                for iv in "${INSTALLED_VERSIONS[@]+"${INSTALLED_VERSIONS[@]}"}"; do
                     [[ "$iv" == "$v" ]] && installed=1
                 done
                 if [[ $installed -eq 1 ]]; then
@@ -328,11 +731,13 @@ do_version_menu() {
         fi
 
         echo ""
+        echo "  Версии устанавливаются глобально и используются инстансами."
+        echo "  Чтобы переключить инстанс на другую версию, отредактируйте"
+        echo "  его в меню «Инстансы» → «Изменить»."
+        echo ""
         echo "  1) Установить версию"
         echo "  2) Удалить версию"
-        echo "  3) Переключить активную версию"
-        echo "  4) Импорт пакетов в packages/"
-        echo "  5) Полная установка (первый раз)"
+        echo "  3) Импорт пакетов в packages/"
         echo ""
         echo "  0) ← Назад"
         echo ""
@@ -341,28 +746,21 @@ do_version_menu() {
         case $choice in
             1) do_install_version ;;
             2) do_uninstall_version ;;
-            3) do_switch_version ;;
-            4) do_import_packages ;;
-            5) do_full_install ;;
+            3) do_import_packages ;;
             0) return ;;
             *) log_warn "Неверный выбор" ;;
         esac
     done
 }
 
-# ============================================================================
-#  УСТАНОВКА ВЕРСИИ
-# ============================================================================
-
 do_install_version() {
     get_available_versions
     get_installed_versions
 
-    # Фильтруем: только ещё не установленные
-    local to_install=()
-    for v in "${AVAILABLE_VERSIONS[@]}"; do
-        local already=0
-        for iv in "${INSTALLED_VERSIONS[@]}"; do
+    local to_install=() v iv already
+    for v in "${AVAILABLE_VERSIONS[@]+"${AVAILABLE_VERSIONS[@]}"}"; do
+        already=0
+        for iv in "${INSTALLED_VERSIONS[@]+"${INSTALLED_VERSIONS[@]}"}"; do
             [[ "$iv" == "$v" ]] && already=1
         done
         [[ $already -eq 0 ]] && to_install+=("$v")
@@ -470,20 +868,15 @@ install_version() {
 
     log_info "Версия ${ver} установлена"
 
-    # Отключаем srv1cv8 если появился
     if systemctl list-unit-files 2>/dev/null | grep -q "srv1cv8"; then
         systemctl stop srv1cv8 2>/dev/null || true
         systemctl disable srv1cv8 2>/dev/null || true
     fi
+    return 0
 }
-
-# ============================================================================
-#  УДАЛЕНИЕ ВЕРСИИ
-# ============================================================================
 
 do_uninstall_version() {
     get_installed_versions
-    detect_active_version
 
     if [[ ${#INSTALLED_VERSIONS[@]} -eq 0 ]]; then
         log_warn "Нет установленных версий"
@@ -491,13 +884,27 @@ do_uninstall_version() {
         return
     fi
 
+    # Собираем версии, используемые активными инстансами — их удалять опасно
+    instance_list
+    local used_by=() name conf_ver
+    for name in "${INSTANCES[@]+"${INSTANCES[@]}"}"; do
+        conf_ver=$(awk -F'"' '/^VERSION=/ {print $2; exit}' "${INSTANCES_DIR}/${name}.conf" 2>/dev/null || true)
+        [[ -n "$conf_ver" ]] && used_by+=("${conf_ver}:${name}")
+    done
+
     echo ""
     echo "  Установленные версии:"
-    local idx=0
+    local idx=0 v u using
     for v in "${INSTALLED_VERSIONS[@]}"; do
         idx=$((idx + 1))
-        if [[ "$v" == "$ACTIVE_VERSION" ]]; then
-            echo -e "    ${idx}) ${v}  ${YELLOW}← активная${NC}"
+        using=""
+        for u in "${used_by[@]+"${used_by[@]}"}"; do
+            if [[ "$u" == "${v}:"* ]]; then
+                using+=" ${u#*:}"
+            fi
+        done
+        if [[ -n "$using" ]]; then
+            echo -e "    ${idx}) ${v}  ${YELLOW}← используется инстансами:${using}${NC}"
         else
             echo "    ${idx}) ${v}"
         fi
@@ -511,17 +918,18 @@ do_uninstall_version() {
 
     if [[ "$num" =~ ^[0-9]+$ ]] && [[ $num -ge 1 ]] && [[ $num -le ${#INSTALLED_VERSIONS[@]} ]]; then
         local selected="${INSTALLED_VERSIONS[$((num - 1))]}"
-
-        if [[ "$selected" == "$ACTIVE_VERSION" ]]; then
+        local in_use=0 u
+        for u in "${used_by[@]+"${used_by[@]}"}"; do
+            [[ "$u" == "${selected}:"* ]] && in_use=1
+        done
+        if [[ $in_use -eq 1 ]]; then
             echo ""
-            log_warn "Версия ${selected} сейчас активна! Служба будет остановлена."
+            log_warn "Версия ${selected} используется инстансами. Удаление сделает их фантомами."
             read -rp "  Продолжить? (y/N): " answer
             if [[ ! "$answer" =~ ^[Yy]$ ]]; then
                 return
             fi
-            systemctl stop ${SERVICE_NAME} 2>/dev/null || true
         fi
-
         uninstall_version "$selected"
         read -rp "  Нажмите Enter..." _
     else
@@ -534,212 +942,18 @@ uninstall_version() {
     echo ""
     log_step "Удаление версии ${ver}..."
 
-    # Удаляем пакеты конкретной версии
     dpkg --purge "1c-enterprise-${ver}-crs"    2>/dev/null || true
     dpkg --purge "1c-enterprise-${ver}-ws"     2>/dev/null || true
     dpkg --purge "1c-enterprise-${ver}-server" 2>/dev/null || true
     dpkg --purge "1c-enterprise-${ver}-common" 2>/dev/null || true
     apt-get autoremove -y -qq > /dev/null 2>&1 || true
 
-    # Проверяем
     if [[ -f "/opt/1cv8/x86_64/${ver}/crserver" ]]; then
         log_warn "Файлы версии ${ver} остались (возможно, заняты другими пакетами)"
     else
         log_info "Версия ${ver} удалена"
     fi
-
-    # Если удалили активную — нужно либо переключить на другую, либо снести службу
-    local was_active=0
-    [[ "$ver" == "$ACTIVE_VERSION" ]] && was_active=1
-
-    detect_active_version
-    get_installed_versions
-
-    if [[ $was_active -eq 1 ]]; then
-        if [[ ${#INSTALLED_VERSIONS[@]} -gt 0 ]]; then
-            # Автоматически переключаемся на первую оставшуюся версию,
-            # чтобы systemd-юнит не указывал на удалённый бинарник
-            local fallback="${INSTALLED_VERSIONS[0]}"
-            log_warn "Активная версия удалена — переключаюсь на ${fallback}"
-            ACTIVE_VERSION="$fallback"
-            ACTIVE_CRSERVER_BIN="/opt/1cv8/x86_64/${fallback}/crserver"
-            regenerate_service
-            systemctl restart ${SERVICE_NAME} 2>/dev/null || \
-                log_warn "Служба не запустилась автоматически — проверьте journalctl -u ${SERVICE_NAME}"
-        else
-            # Удаляем службу — версий не осталось
-            if [[ -f /etc/systemd/system/${SERVICE_NAME}.service ]]; then
-                systemctl disable ${SERVICE_NAME} 2>/dev/null || true
-                rm -f /etc/systemd/system/${SERVICE_NAME}.service
-                systemctl daemon-reload
-                log_info "Служба удалена (нет установленных версий)"
-            fi
-        fi
-    fi
 }
-
-# ============================================================================
-#  ПЕРЕКЛЮЧЕНИЕ ВЕРСИИ
-# ============================================================================
-
-do_switch_version() {
-    get_installed_versions
-    detect_active_version
-
-    if [[ ${#INSTALLED_VERSIONS[@]} -eq 0 ]]; then
-        log_warn "Нет установленных версий"
-        read -rp "  Нажмите Enter..." _
-        return
-    fi
-
-    # Спецслучай: ровно одна установленная версия.
-    # Если активная — фантом (юнит ссылается на удалённый бинарник),
-    # переключаемся на единственную реальную автоматически.
-    if [[ ${#INSTALLED_VERSIONS[@]} -eq 1 ]]; then
-        local only="${INSTALLED_VERSIONS[0]}"
-        if [[ "$ACTIVE_VERSION_PHANTOM" -eq 1 ]]; then
-            log_warn "Активная версия (${ACTIVE_VERSION}) указана в systemd-юните,"
-            log_warn "но её бинарник отсутствует. Доступна только: ${only}"
-            echo ""
-            read -rp "  Переключить службу на ${only}? (Y/n): " ans
-            if [[ "$ans" =~ ^[Nn]$ ]]; then
-                return
-            fi
-            switch_to_version "$only"
-            read -rp "  Нажмите Enter..." _
-            return
-        fi
-        if [[ "$only" == "$ACTIVE_VERSION" ]]; then
-            log_info "Установлена только одна версия (${only}), она уже активна"
-        else
-            log_warn "Установлена только одна версия (${only}), но активная другая (${ACTIVE_VERSION})"
-            echo ""
-            read -rp "  Переключить службу на ${only}? (Y/n): " ans
-            if [[ "$ans" =~ ^[Nn]$ ]]; then
-                return
-            fi
-            switch_to_version "$only"
-        fi
-        read -rp "  Нажмите Enter..." _
-        return
-    fi
-
-    echo ""
-    if [[ "$ACTIVE_VERSION_PHANTOM" -eq 1 ]]; then
-        log_warn "Внимание: активная версия в юните (${ACTIVE_VERSION}) — фантом (бинарник удалён)"
-        echo ""
-    fi
-
-    echo "  Установленные версии:"
-    local idx=0
-    local v
-    for v in "${INSTALLED_VERSIONS[@]}"; do
-        idx=$((idx + 1))
-        if [[ "$v" == "$ACTIVE_VERSION" && "$ACTIVE_VERSION_PHANTOM" -eq 0 ]]; then
-            echo -e "    ${idx}) ${v}  ${GREEN}← активная${NC}"
-        else
-            echo "    ${idx}) ${v}"
-        fi
-    done
-    echo ""
-    read -rp "  Переключить на версию (номер, или 0 для отмены): " num
-
-    if [[ "$num" == "0" || -z "$num" ]]; then
-        return
-    fi
-
-    if [[ "$num" =~ ^[0-9]+$ ]] && [[ $num -ge 1 ]] && [[ $num -le ${#INSTALLED_VERSIONS[@]} ]]; then
-        local selected="${INSTALLED_VERSIONS[$((num - 1))]}"
-
-        # Если активная — фантом, любое переключение оправдано (даже если совпадает имя)
-        if [[ "$selected" == "$ACTIVE_VERSION" && "$ACTIVE_VERSION_PHANTOM" -eq 0 ]]; then
-            log_info "Версия ${selected} уже активна"
-            read -rp "  Нажмите Enter..." _
-            return
-        fi
-
-        switch_to_version "$selected"
-        read -rp "  Нажмите Enter..." _
-    else
-        log_error "Неверный номер"
-    fi
-}
-
-switch_to_version() {
-    local ver="$1"
-    local new_bin="/opt/1cv8/x86_64/${ver}/crserver"
-
-    if [[ ! -f "$new_bin" ]]; then
-        log_error "crserver не найден: $new_bin"
-        return 1
-    fi
-    if [[ ! -x "$new_bin" ]]; then
-        log_warn "Файл $new_bin не исполняемый, ставлю +x"
-        chmod +x "$new_bin" 2>/dev/null || true
-    fi
-
-    log_step "Переключение на версию ${ver}..."
-
-    # 1) Останавливаем текущую службу с явным ожиданием полного завершения
-    if systemctl is-active --quiet ${SERVICE_NAME} 2>/dev/null; then
-        log_step "Остановка текущей службы..."
-        if ! systemctl stop ${SERVICE_NAME}; then
-            log_warn "systemctl stop вернул ошибку, продолжаю"
-        fi
-        # Ждём, пока порт освободится (до 15 секунд)
-        local i
-        for i in {1..15}; do
-            if ! ss -tln 2>/dev/null | grep -q ":${REPO_PORT}\b"; then
-                break
-            fi
-            sleep 1
-        done
-        if ss -tln 2>/dev/null | grep -q ":${REPO_PORT}\b"; then
-            log_warn "Порт ${REPO_PORT} всё ещё занят — попытка форсированного завершения"
-            pkill -TERM -f "crserver.*-port[ =]*${REPO_PORT}" 2>/dev/null || true
-            sleep 2
-            pkill -KILL -f "crserver.*-port[ =]*${REPO_PORT}" 2>/dev/null || true
-            sleep 1
-        fi
-    fi
-
-    # 2) Пересоздаём systemd-юнит с новой версией
-    ACTIVE_VERSION="$ver"
-    ACTIVE_CRSERVER_BIN="$new_bin"
-    if ! regenerate_service; then
-        log_error "Не удалось пересоздать systemd-службу"
-        return 1
-    fi
-
-    # 3) Запускаем (без падения скрипта при ошибке)
-    log_step "Запуск службы..."
-    local start_rc=0
-    systemctl start ${SERVICE_NAME} || start_rc=$?
-
-    # Дать systemd шанс stабилизироваться
-    sleep 2
-
-    if systemctl is-active --quiet ${SERVICE_NAME}; then
-        log_info "Переключено на версию ${ver} — служба запущена"
-        if ss -tln 2>/dev/null | grep -q ":${REPO_PORT}\b"; then
-            log_info "Порт ${REPO_PORT} слушается"
-        else
-            log_warn "Служба активна, но порт ${REPO_PORT} ещё не слушается (подождите несколько секунд)"
-        fi
-        return 0
-    else
-        log_error "Служба не запустилась (systemctl start exit=${start_rc})"
-        echo "  Последние строки журнала:"
-        journalctl -u ${SERVICE_NAME} -n 20 --no-pager 2>/dev/null | sed 's/^/    /' || true
-        echo ""
-        echo "  Полный лог: journalctl -u ${SERVICE_NAME} -n 100"
-        return 1
-    fi
-}
-
-# ============================================================================
-#  ИМПОРТ ПАКЕТОВ
-# ============================================================================
 
 do_import_packages() {
     echo ""
@@ -767,13 +981,11 @@ do_import_packages() {
         *) log_warn "Неверный выбор"; return ;;
     esac
 
-    # Ищем .deb пакеты crs в источнике
     local found_versions=()
     local crs_file ver fv dup
     while IFS= read -r crs_file; do
         ver=$(basename "$crs_file" | grep -oP '8\.3\.\d+\.\d+' || true)
         if [[ -n "$ver" ]]; then
-            # Проверяем что нет дубликатов
             dup=0
             for fv in "${found_versions[@]+"${found_versions[@]}"}"; do
                 [[ "$fv" == "$ver" ]] && dup=1
@@ -792,12 +1004,10 @@ do_import_packages() {
     for ver in "${found_versions[@]}"; do
         dest="${PACKAGES_DIR}/${ver}"
         mkdir -p "$dest"
-
         count=0
         failed=0
         for deb in "$source_dir"/1c-enterprise-${ver}-*.deb; do
             [[ -f "$deb" ]] || continue
-            # Пропускаем NLS-пакеты (валидатор их игнорирует)
             [[ "$(basename "$deb")" == *-nls* ]] && continue
             if cp "$deb" "$dest/"; then
                 count=$((count + 1))
@@ -806,7 +1016,6 @@ do_import_packages() {
                 log_warn "  не удалось скопировать: $(basename "$deb")"
             fi
         done
-
         if [[ $failed -eq 0 ]]; then
             log_info "Версия ${ver}: скопировано ${count} пакетов → ${dest}/"
         else
@@ -819,29 +1028,499 @@ do_import_packages() {
 }
 
 # ============================================================================
+#  ИНСТАНСЫ — МЕНЮ И ОПЕРАЦИИ
+# ============================================================================
+
+do_instance_menu() {
+    while true; do
+        instance_list
+        local def
+        def=$(instance_default)
+
+        echo ""
+        echo -e "${BOLD}══════════════════════════════════════════════════${NC}"
+        echo -e "  Инстансы (crserver@<имя>)"
+        echo -e "${BOLD}══════════════════════════════════════════════════${NC}"
+        echo ""
+
+        if [[ ${#INSTANCES[@]} -eq 0 ]]; then
+            echo "  (инстансов нет)"
+        else
+            echo "  Существующие:"
+            echo "  ─────────────────────────────────────────────"
+            local n status_text status_color mark ver port
+            for n in "${INSTANCES[@]}"; do
+                status_text=$(instance_status "$n")
+                case "$status_text" in
+                    running) status_color="${GREEN}" ;;
+                    stopped) status_color="${YELLOW}" ;;
+                    failed)  status_color="${RED}" ;;
+                    phantom) status_color="${RED}" ;;
+                    *)       status_color="${NC}" ;;
+                esac
+                mark=""
+                [[ "$n" == "$def" ]] && mark=" ${CYAN}(default)${NC}"
+                ver=$(awk -F'"' '/^VERSION=/   {print $2; exit}' "${INSTANCES_DIR}/${n}.conf" 2>/dev/null || true)
+                port=$(awk -F'"' '/^REPO_PORT=/ {print $2; exit}' "${INSTANCES_DIR}/${n}.conf" 2>/dev/null || true)
+                echo -e "    ${n}  v${ver:-?}  port=${port:-?}  [${status_color}${status_text}${NC}]${mark}"
+            done
+        fi
+
+        local legacy_present=0
+        if [[ -f "$LEGACY_SERVICE_FILE" ]]; then
+            legacy_present=1
+        fi
+
+        echo ""
+        echo "  1) Создать инстанс"
+        echo "  2) Удалить инстанс"
+        echo "  3) Изменить инстанс (версия/порт/каталоги)"
+        echo "  4) Назначить инстанс по умолчанию"
+        echo "  5) Подробная информация об инстансе"
+        echo "  6) Запустить/Остановить/Перезапустить"
+        if [[ $legacy_present -eq 1 ]]; then
+            echo -e "  7) ${YELLOW}Миграция со старой установки (v1.x → v2)${NC}"
+        fi
+        echo "  8) Регенерировать systemd-template"
+        echo ""
+        echo "  0) ← Назад"
+        echo ""
+        read -rp "  Выберите: " choice
+
+        case $choice in
+            1) do_instance_create ;;
+            2) do_instance_delete ;;
+            3) do_instance_edit ;;
+            4) do_instance_set_default ;;
+            5) do_instance_info ;;
+            6) do_instance_service ;;
+            7)
+                if [[ $legacy_present -eq 1 ]]; then
+                    migrate_legacy
+                    read -rp "  Нажмите Enter..." _
+                else
+                    log_warn "Неверный выбор"
+                fi
+                ;;
+            8)
+                regenerate_systemd_template
+                log_info "Template /etc/systemd/system/crserver@.service создан/перезаписан"
+                read -rp "  Нажмите Enter..." _
+                ;;
+            0) return ;;
+            *) log_warn "Неверный выбор" ;;
+        esac
+    done
+}
+
+do_instance_create() {
+    echo ""
+    echo "  Создание нового инстанса"
+    echo "  ─────────────────────────────────────────────"
+    read -rp "  Имя (a-z, цифры, дефисы; до 32 символов): " name
+    if ! instance_name_valid "$name"; then
+        log_error "Недопустимое имя"
+        return
+    fi
+    if instance_exists "$name"; then
+        log_error "Инстанс уже существует: ${name}"
+        return
+    fi
+
+    get_installed_versions
+    if [[ ${#INSTALLED_VERSIONS[@]} -eq 0 ]]; then
+        log_error "Нет установленных версий 1С. Установите версию через меню «Управление версиями»."
+        return
+    fi
+
+    local ver=""
+    if [[ ${#INSTALLED_VERSIONS[@]} -eq 1 ]]; then
+        ver="${INSTALLED_VERSIONS[0]}"
+        echo "  Версия:    ${ver}  (единственная установленная)"
+    else
+        echo ""
+        echo "  Установленные версии:"
+        local idx=0 v
+        for v in "${INSTALLED_VERSIONS[@]}"; do
+            idx=$((idx + 1))
+            echo "    ${idx}) ${v}"
+        done
+        read -rp "  Номер: " num
+        if ! [[ "$num" =~ ^[0-9]+$ ]] || (( num < 1 || num > ${#INSTALLED_VERSIONS[@]} )); then
+            log_error "Неверный номер"
+            return
+        fi
+        ver="${INSTALLED_VERSIONS[$((num - 1))]}"
+    fi
+
+    local default_port="${DEFAULT_REPO_PORT}"
+    # Если порт уже занят другим инстансом — предложим следующий свободный
+    instance_list
+    local n existing_port
+    for n in "${INSTANCES[@]+"${INSTANCES[@]}"}"; do
+        existing_port=$(awk -F'"' '/^REPO_PORT=/ {print $2; exit}' "${INSTANCES_DIR}/${n}.conf" 2>/dev/null || true)
+        if [[ "$existing_port" == "$default_port" ]]; then
+            default_port=$((default_port + 1))
+        fi
+    done
+
+    read -rp "  Порт [${default_port}]: " port
+    port="${port:-$default_port}"
+    if ! [[ "$port" =~ ^[0-9]+$ ]] || (( port < 1 || port > 65535 )); then
+        log_error "Некорректный порт"
+        return
+    fi
+    # Проверка, что порт не занят другим инстансом
+    for n in "${INSTANCES[@]+"${INSTANCES[@]}"}"; do
+        existing_port=$(awk -F'"' '/^REPO_PORT=/ {print $2; exit}' "${INSTANCES_DIR}/${n}.conf" 2>/dev/null || true)
+        if [[ "$existing_port" == "$port" ]]; then
+            log_error "Порт ${port} уже используется инстансом ${n}"
+            return
+        fi
+    done
+
+    local default_repo="${REPO_BASE}/repo-${name}"
+    local default_log="${LOG_BASE}/${name}"
+    read -rp "  Каталог хранилищ [${default_repo}]: " repo_dir
+    repo_dir="${repo_dir:-$default_repo}"
+    read -rp "  Каталог логов     [${default_log}]: " log_dir
+    log_dir="${log_dir:-$default_log}"
+
+    INST_VERSION="$ver"
+    INST_PORT="$port"
+    INST_REPO_DIR="$repo_dir"
+    INST_LOG_DIR="$log_dir"
+
+    if ! instance_save "$name"; then
+        return 1
+    fi
+
+    detect_1c_user
+    mkdir -p "$repo_dir" "$log_dir" "$BACKUP_DIR"
+    if [[ -n "${SVC_USER:-}" && -n "${SVC_GROUP:-}" ]]; then
+        chown -R "${SVC_USER}:${SVC_GROUP}" "$repo_dir" "$log_dir" 2>/dev/null || true
+    fi
+
+    generate_systemd_template
+    systemctl daemon-reload
+
+    if systemctl enable "crserver@${name}.service" >/dev/null 2>&1; then
+        log_info "enabled: crserver@${name}"
+    else
+        log_warn "systemctl enable вернул ошибку"
+    fi
+
+    add_input_for_port "$port"
+
+    # Если это первый инстанс — назначим дефолтным
+    instance_list
+    if [[ ${#INSTANCES[@]} -eq 1 ]]; then
+        instance_set_default "$name"
+        log_info "Установлен по умолчанию: ${name}"
+    fi
+
+    echo ""
+    log_info "Инстанс ${name} создан"
+    echo "  Запустить: systemctl start crserver@${name}  (или через меню → 6)"
+    read -rp "  Нажмите Enter..." _
+}
+
+do_instance_delete() {
+    if ! select_instance_interactive; then
+        return
+    fi
+    local name="$SELECTED_INSTANCE"
+    instance_load "$name" || return 1
+
+    echo ""
+    echo "  Удаление инстанса '${name}'"
+    echo "  ─────────────────────────────────────────────"
+    echo "    Версия:    ${INST_VERSION}"
+    echo "    Порт:      ${INST_PORT}"
+    echo "    Хранилища: ${INST_REPO_DIR}"
+    echo "    Логи:      ${INST_LOG_DIR}"
+    echo ""
+    log_warn "Будут удалены: конфиг инстанса, systemd-юнит (disabled), правило файрвола."
+    log_warn "Каталог хранилищ ПО УМОЛЧАНИЮ НЕ удаляется."
+    echo ""
+    read -rp "  Удалить также каталог хранилищ? (y/N): " purge_ans
+    local purge=0
+    [[ "$purge_ans" =~ ^[Yy]$ ]] && purge=1
+
+    echo ""
+    read -rp "  Введите имя инстанса '${name}' для подтверждения: " confirm
+    if [[ "$confirm" != "$name" ]]; then
+        log_warn "Отменено (имя не совпало)"
+        return
+    fi
+
+    log_step "Остановка..."
+    systemctl stop "crserver@${name}.service" 2>/dev/null || true
+    systemctl disable "crserver@${name}.service" 2>/dev/null || true
+
+    rm -f "${INSTANCES_DIR}/${name}.conf"
+    log_info "Конфиг удалён: ${INSTANCES_DIR}/${name}.conf"
+
+    # Per-instance цепочка файрвола, если есть
+    cleanup_instance_chain "$name"
+    remove_input_for_port "$INST_PORT"
+
+    if [[ $purge -eq 1 ]]; then
+        if [[ -d "$INST_REPO_DIR" ]]; then
+            log_step "Удаление каталога хранилищ ${INST_REPO_DIR}..."
+            rm -rf "$INST_REPO_DIR" || log_warn "rm -rf завершился с ошибкой"
+        fi
+    fi
+
+    # Если это был дефолтный — снимаем указатель
+    if [[ -f "$DEFAULT_INSTANCE_FILE" ]]; then
+        local cur
+        cur=$(head -1 "$DEFAULT_INSTANCE_FILE" 2>/dev/null | tr -d '[:space:]' || true)
+        if [[ "$cur" == "$name" ]]; then
+            rm -f "$DEFAULT_INSTANCE_FILE"
+            log_info "Сняли указатель default-instance"
+        fi
+    fi
+
+    systemctl daemon-reload
+    log_info "Инстанс ${name} удалён"
+    read -rp "  Нажмите Enter..." _
+}
+
+do_instance_edit() {
+    if ! select_instance_interactive; then
+        return
+    fi
+    local name="$SELECTED_INSTANCE"
+    instance_load "$name" || return 1
+
+    echo ""
+    echo "  Редактирование '${name}' (Enter — оставить как есть)"
+    echo "  ─────────────────────────────────────────────"
+
+    get_installed_versions
+    echo "  Установленные версии: ${INSTALLED_VERSIONS[*]:-(нет)}"
+    read -rp "  VERSION   [${INST_VERSION}]: " new_ver
+    new_ver="${new_ver:-$INST_VERSION}"
+
+    read -rp "  PORT      [${INST_PORT}]: " new_port
+    new_port="${new_port:-$INST_PORT}"
+    if ! [[ "$new_port" =~ ^[0-9]+$ ]] || (( new_port < 1 || new_port > 65535 )); then
+        log_error "Некорректный порт"
+        return
+    fi
+    # Проверка коллизий портов с другими инстансами
+    if [[ "$new_port" != "$INST_PORT" ]]; then
+        instance_list
+        local n existing_port
+        for n in "${INSTANCES[@]+"${INSTANCES[@]}"}"; do
+            [[ "$n" == "$name" ]] && continue
+            existing_port=$(awk -F'"' '/^REPO_PORT=/ {print $2; exit}' "${INSTANCES_DIR}/${n}.conf" 2>/dev/null || true)
+            if [[ "$existing_port" == "$new_port" ]]; then
+                log_error "Порт ${new_port} уже используется инстансом ${n}"
+                return
+            fi
+        done
+    fi
+
+    read -rp "  REPO_DIR  [${INST_REPO_DIR}]: " new_repo
+    new_repo="${new_repo:-$INST_REPO_DIR}"
+    read -rp "  LOG_DIR   [${INST_LOG_DIR}]: " new_log
+    new_log="${new_log:-$INST_LOG_DIR}"
+
+    local was_active=0
+    if systemctl is-active --quiet "crserver@${name}.service" 2>/dev/null; then
+        was_active=1
+    fi
+
+    if [[ $was_active -eq 1 ]]; then
+        log_step "Останавливаю инстанс на время изменения..."
+        systemctl stop "crserver@${name}.service" 2>/dev/null || true
+    fi
+
+    # Если меняется REPO_DIR — переносим (или хотя бы создаём новый)
+    if [[ "$new_repo" != "$INST_REPO_DIR" ]]; then
+        if [[ -d "$INST_REPO_DIR" && ! -e "$new_repo" ]]; then
+            log_step "Перенос каталога хранилищ..."
+            move_dir_safe "$INST_REPO_DIR" "$new_repo" || log_warn "Перенос не удался — создаю пустой"
+        fi
+        mkdir -p "$new_repo"
+    fi
+    if [[ "$new_log" != "$INST_LOG_DIR" ]]; then
+        if [[ -d "$INST_LOG_DIR" && ! -e "$new_log" ]]; then
+            move_dir_safe "$INST_LOG_DIR" "$new_log" || log_warn "Перенос логов не удался"
+        fi
+        mkdir -p "$new_log"
+    fi
+
+    # Файрвол: если порт изменился — обновим INPUT
+    if [[ "$new_port" != "$INST_PORT" ]]; then
+        remove_input_for_port "$INST_PORT"
+        add_input_for_port "$new_port"
+    fi
+
+    INST_VERSION="$new_ver"
+    INST_PORT="$new_port"
+    INST_REPO_DIR="$new_repo"
+    INST_LOG_DIR="$new_log"
+
+    if ! instance_save "$name"; then
+        log_error "Не удалось сохранить конфиг"
+        return 1
+    fi
+
+    detect_1c_user
+    if [[ -n "${SVC_USER:-}" && -n "${SVC_GROUP:-}" ]]; then
+        chown -R "${SVC_USER}:${SVC_GROUP}" "$INST_REPO_DIR" "$INST_LOG_DIR" 2>/dev/null || true
+    fi
+
+    systemctl daemon-reload
+    log_info "Инстанс ${name} обновлён"
+
+    if [[ $was_active -eq 1 ]]; then
+        log_step "Запуск..."
+        if systemctl start "crserver@${name}.service"; then
+            log_info "Запущен"
+        else
+            log_error "Не удалось запустить — journalctl -u crserver@${name}"
+        fi
+    fi
+    read -rp "  Нажмите Enter..." _
+}
+
+do_instance_set_default() {
+    if ! select_instance_interactive; then
+        return
+    fi
+    if instance_set_default "$SELECTED_INSTANCE"; then
+        log_info "По умолчанию: ${SELECTED_INSTANCE}"
+    fi
+    read -rp "  Нажмите Enter..." _
+}
+
+do_instance_info() {
+    if ! select_instance_interactive; then
+        return
+    fi
+    local name="$SELECTED_INSTANCE"
+    instance_load "$name" || return 1
+    local status_text bin ip_addr
+    status_text=$(instance_status "$name")
+    bin="/opt/1cv8/x86_64/${INST_VERSION}/crserver"
+    ip_addr=$(get_primary_ip)
+
+    echo ""
+    echo "  Инстанс '${name}'"
+    echo "  ─────────────────────────────────────────────"
+    echo "    Статус:        ${status_text}"
+    echo "    Юнит:          crserver@${name}.service"
+    echo "    Версия:        ${INST_VERSION}"
+    echo "    Бинарник:      ${bin}$([ -f "$bin" ] || echo "  (НЕ СУЩЕСТВУЕТ)")"
+    echo "    Порт:          ${INST_PORT}"
+    echo "    Каталог:       ${INST_REPO_DIR}"
+    echo "    Логи:          ${INST_LOG_DIR}"
+    echo "    Адрес:         tcp://${ip_addr}:${INST_PORT}/<имя_хранилища>"
+    if ss -tln 2>/dev/null | grep -q ":${INST_PORT}\b"; then
+        echo "    Порт слушается: да"
+    else
+        echo "    Порт слушается: нет"
+    fi
+    echo ""
+    read -rp "  Нажмите Enter..." _
+}
+
+do_instance_service() {
+    if ! select_instance_interactive; then
+        return
+    fi
+    local name="$SELECTED_INSTANCE"
+    while true; do
+        local status_text status_color
+        status_text=$(instance_status "$name")
+        case "$status_text" in
+            running) status_color="${GREEN}" ;;
+            failed|phantom) status_color="${RED}" ;;
+            *)       status_color="${YELLOW}" ;;
+        esac
+
+        echo ""
+        echo -e "${BOLD}══════════════════════════════════════════════════${NC}"
+        echo -e "  Управление инстансом '${name}'   Статус: ${status_color}${status_text}${NC}"
+        echo -e "${BOLD}══════════════════════════════════════════════════${NC}"
+        echo ""
+        echo "  1) Запустить"
+        echo "  2) Остановить"
+        echo "  3) Перезапустить"
+        echo "  4) Подробный статус"
+        echo "  5) Логи (последние 50)"
+        echo "  6) Логи в реальном времени"
+        echo ""
+        echo "  0) ← Назад"
+        echo ""
+        read -rp "  Выберите: " choice
+        local unit="crserver@${name}.service"
+        case $choice in
+            1)
+                if systemctl start "$unit"; then log_info "Запущен"; else log_error "Ошибка"; fi
+                sleep 1
+                ;;
+            2)
+                if systemctl stop "$unit"; then log_info "Остановлен"; else log_error "Ошибка"; fi
+                ;;
+            3)
+                if systemctl restart "$unit"; then log_info "Перезапущен"; else log_error "Ошибка"; fi
+                sleep 1
+                ;;
+            4)
+                echo ""
+                systemctl status "$unit" --no-pager 2>/dev/null || log_warn "Юнит не найден"
+                read -rp "  Нажмите Enter..." _
+                ;;
+            5)
+                echo ""
+                journalctl -u "$unit" -n 50 --no-pager 2>/dev/null || log_warn "Нет логов"
+                read -rp "  Нажмите Enter..." _
+                ;;
+            6)
+                echo ""
+                echo "  (Ctrl+C для выхода)"
+                journalctl -u "$unit" -f 2>/dev/null || true
+                ;;
+            0) return ;;
+            *) log_warn "Неверный выбор" ;;
+        esac
+    done
+}
+
+# ============================================================================
 #  ПОЛНАЯ УСТАНОВКА (ПЕРВЫЙ РАЗ)
 # ============================================================================
 
 do_full_install() {
     echo ""
     echo -e "${BOLD}══════════════════════════════════════════════════${NC}"
-    echo -e "${BOLD}  Полная установка сервера хранилища 1С${NC}"
+    echo -e "${BOLD}  Первичная установка сервера хранилища 1С${NC}"
     echo -e "${BOLD}══════════════════════════════════════════════════${NC}"
     echo ""
 
-    # --- Выбор версии ---
-    get_available_versions
+    # Если есть старая установка — предлагаем миграцию
+    if [[ -f "$LEGACY_SERVICE_FILE" ]]; then
+        log_warn "Обнаружена старая установка (crserver.service). Используйте миграцию"
+        log_warn "из меню «Инстансы» → «Миграция со старой установки» вместо install."
+        echo ""
+        read -rp "  Открыть меню миграции сейчас? (Y/n): " ans
+        if [[ ! "$ans" =~ ^[Nn]$ ]]; then
+            migrate_legacy
+        fi
+        return
+    fi
 
+    get_available_versions
     if [[ ${#AVAILABLE_VERSIONS[@]} -eq 0 ]]; then
         log_warn "Нет доступных пакетов в ${PACKAGES_DIR}/"
         echo ""
-        echo "  Шаг 1: Создайте каталог версии:"
-        echo "    mkdir -p ${PACKAGES_DIR}/8.3.25.1560"
-        echo ""
-        echo "  Шаг 2: Скопируйте 4 .deb пакета:"
-        echo "    cp 1c-enterprise-*-{common,server,ws,crs}_*.deb ${PACKAGES_DIR}/8.3.25.1560/"
-        echo ""
-        echo "  Или используйте пункт '4) Импорт пакетов' для автоматического импорта."
+        echo "  Шаг 1: создайте каталог:    mkdir -p ${PACKAGES_DIR}/8.3.25.1560"
+        echo "  Шаг 2: скопируйте пакеты:   cp 1c-enterprise-*-{common,server,ws,crs}_*.deb ..."
         echo ""
         read -rp "  Нажмите Enter..." _
         return
@@ -853,13 +1532,13 @@ do_full_install() {
         echo "  Доступна версия: ${target_ver}"
     else
         echo "  Доступные версии:"
-        local idx=0
+        local idx=0 v
         for v in "${AVAILABLE_VERSIONS[@]}"; do
             idx=$((idx + 1))
             echo "    ${idx}) ${v}"
         done
         echo ""
-        read -rp "  Выберите версию для установки: " num
+        read -rp "  Выберите версию: " num
         if [[ "$num" =~ ^[0-9]+$ ]] && [[ $num -ge 1 ]] && [[ $num -le ${#AVAILABLE_VERSIONS[@]} ]]; then
             target_ver="${AVAILABLE_VERSIONS[$((num - 1))]}"
         else
@@ -869,42 +1548,65 @@ do_full_install() {
     fi
 
     if ! validate_version_packages "$target_ver"; then
-        log_error "Неполный набор пакетов для версии ${target_ver}"
-        echo "  Нужны: common, server, ws, crs"
+        log_error "Неполный набор пакетов для ${target_ver}"
         read -rp "  Нажмите Enter..." _
         return
     fi
 
     echo ""
-    read -rp "  Начать полную установку версии ${target_ver}? (Y/n): " answer
+    read -rp "  Имя инстанса [default]: " inst_name
+    inst_name="${inst_name:-default}"
+    if ! instance_name_valid "$inst_name"; then
+        log_error "Недопустимое имя инстанса"
+        return
+    fi
+    if instance_exists "$inst_name"; then
+        log_error "Инстанс '${inst_name}' уже существует"
+        return
+    fi
+
+    read -rp "  Порт [${DEFAULT_REPO_PORT}]: " inst_port
+    inst_port="${inst_port:-$DEFAULT_REPO_PORT}"
+    if ! [[ "$inst_port" =~ ^[0-9]+$ ]] || (( inst_port < 1 || inst_port > 65535 )); then
+        log_error "Некорректный порт"
+        return
+    fi
+
+    local inst_repo="${REPO_BASE}/repo-${inst_name}"
+    local inst_log="${LOG_BASE}/${inst_name}"
+
+    echo ""
+    echo "  Будет установлено:"
+    echo "    Версия:     ${target_ver}"
+    echo "    Инстанс:    ${inst_name}"
+    echo "    Порт:       ${inst_port}"
+    echo "    Хранилища:  ${inst_repo}"
+    echo "    Логи:       ${inst_log}"
+    echo ""
+    read -rp "  Начать установку? (Y/n): " answer
     if [[ "$answer" =~ ^[Nn]$ ]]; then
         return
     fi
 
-    # --- 1. Системные зависимости ---
     log_step "Установка системных зависимостей..."
     apt-get update -qq
     apt-get install -y -qq \
         wget tar fontconfig libfreetype6 libgsf-1-114 \
         libglib2.0-0 libodbc2 imagemagick locales curl \
-        iptables-persistent \
+        iptables-persistent rsync \
         > /dev/null 2>&1 || true
     log_info "Зависимости установлены"
 
-    # --- 2. Локаль ---
     log_step "Настройка локали ru_RU.UTF-8..."
     sed -i 's/# ru_RU.UTF-8 UTF-8/ru_RU.UTF-8 UTF-8/' /etc/locale.gen 2>/dev/null || true
     locale-gen > /dev/null 2>&1 || true
     log_info "Локаль настроена"
 
-    # --- 3. Установка пакетов ---
     install_version "$target_ver"
 
-    # --- 4. Пользователь и каталоги ---
-    log_step "Настройка пользователя и каталогов..."
+    log_step "Настройка пользователя..."
     detect_1c_user
-
-    if [[ -z "$SVC_GROUP" ]]; then
+    if [[ -z "${SVC_GROUP:-}" ]]; then
         groupadd -r grp1cv8 2>/dev/null || true
         useradd -r -s /bin/bash -m -d /home/usr1cv8 -g grp1cv8 usr1cv8 2>/dev/null || true
         SVC_GROUP="grp1cv8"
@@ -913,64 +1615,66 @@ do_full_install() {
         log_info "Пользователь: ${SVC_USER}:${SVC_GROUP}"
     fi
 
-    mkdir -p "$REPO_DIR" "$LOG_DIR" "$BACKUP_DIR"
-    chown -R "${SVC_USER}:${SVC_GROUP}" "$REPO_DIR"
-    chown -R "${SVC_USER}:${SVC_GROUP}" "$LOG_DIR"
+    mkdir -p "$inst_repo" "$inst_log" "$BACKUP_DIR" "$INSTANCES_DIR"
+    chown -R "${SVC_USER}:${SVC_GROUP}" "$inst_repo" "$inst_log"
     log_info "Каталоги созданы"
 
-    # --- 5. Systemd-служба ---
-    ACTIVE_VERSION="$target_ver"
-    ACTIVE_CRSERVER_BIN="/opt/1cv8/x86_64/${target_ver}/crserver"
-    log_step "Создание systemd-службы..."
-    if ! regenerate_service; then
-        log_error "Не удалось создать systemd-службу"
+    INST_VERSION="$target_ver"
+    INST_PORT="$inst_port"
+    INST_REPO_DIR="$inst_repo"
+    INST_LOG_DIR="$inst_log"
+    if ! instance_save "$inst_name"; then
+        log_error "Не удалось сохранить конфиг инстанса"
         return 1
     fi
-    log_info "Служба создана"
 
-    # --- 6. Файрвол ---
+    log_step "Создание systemd-template..."
+    generate_systemd_template
+    systemctl daemon-reload
+
+    if systemctl enable "crserver@${inst_name}.service" >/dev/null 2>&1; then
+        log_info "enabled: crserver@${inst_name}"
+    else
+        log_warn "systemctl enable вернул ошибку"
+    fi
+
+    instance_set_default "$inst_name"
+
     log_step "Настройка файрвола..."
     setup_firewall_chain
+    add_input_for_port "$inst_port"
     log_info "Файрвол настроен"
 
-    # --- 7. Запуск ---
-    log_step "Запуск сервера хранилища..."
+    log_step "Запуск crserver@${inst_name}..."
     local start_rc=0
-    systemctl start ${SERVICE_NAME} || start_rc=$?
+    systemctl start "crserver@${inst_name}.service" || start_rc=$?
     sleep 2
 
-    if systemctl is-active --quiet ${SERVICE_NAME}; then
+    if systemctl is-active --quiet "crserver@${inst_name}.service"; then
         log_info "Сервер хранилища ЗАПУЩЕН"
     else
-        log_error "Не удалось запустить (systemctl start exit=${start_rc})"
-        echo "  Последние строки журнала:"
-        journalctl -u ${SERVICE_NAME} -n 20 --no-pager 2>/dev/null | sed 's/^/    /' || true
+        log_error "Не удалось запустить (exit=${start_rc})"
+        echo "  Лог: journalctl -u crserver@${inst_name} -n 50"
         return 1
     fi
 
-    if ss -tlnp | grep -q ":${REPO_PORT}"; then
-        log_info "Порт ${REPO_PORT} слушается"
+    if ss -tlnp 2>/dev/null | grep -q ":${inst_port}"; then
+        log_info "Порт ${inst_port} слушается"
     fi
 
-    save_config
-
-    # --- Итог ---
     echo ""
     echo -e "${BOLD}══════════════════════════════════════════════════${NC}"
     echo -e "${GREEN}  УСТАНОВКА ЗАВЕРШЕНА${NC}"
     echo -e "${BOLD}══════════════════════════════════════════════════${NC}"
+    local IP_ADDR
     IP_ADDR=$(get_primary_ip)
     echo ""
+    echo "  Инстанс:  ${inst_name}"
     echo "  Версия:   ${target_ver}"
-    echo "  Адрес:    tcp://${IP_ADDR}:${REPO_PORT}/<имя_хранилища>"
-    echo "  Пример:   tcp://${IP_ADDR}:${REPO_PORT}/trade_dev"
+    echo "  Адрес:    tcp://${IP_ADDR}:${inst_port}/<имя_хранилища>"
     echo ""
     read -rp "  Нажмите Enter..." _
 }
-
-# ============================================================================
-#  ПОЛНОЕ УДАЛЕНИЕ
-# ============================================================================
 
 do_full_uninstall() {
     echo ""
@@ -979,16 +1683,27 @@ do_full_uninstall() {
     echo -e "${BOLD}══════════════════════════════════════════════════${NC}"
     echo ""
 
+    instance_list
     get_installed_versions
 
     echo "  Что будет удалено:"
-    echo "    • Служба ${SERVICE_NAME}"
-    for v in "${INSTALLED_VERSIONS[@]}"; do
-        echo "    • Пакеты версии ${v}"
-    done
-    echo "    • Правила файрвола"
+    if [[ ${#INSTANCES[@]} -gt 0 ]]; then
+        local n
+        for n in "${INSTANCES[@]}"; do
+            echo "    • Инстанс ${n}"
+        done
+    fi
+    if [[ ${#INSTALLED_VERSIONS[@]} -gt 0 ]]; then
+        local v
+        for v in "${INSTALLED_VERSIONS[@]}"; do
+            echo "    • Пакеты версии ${v}"
+        done
+    fi
+    echo "    • systemd-template crserver@.service"
+    echo "    • Правила файрвола (цепочки)"
+    echo "    • ${ETC_DIR}/"
     echo ""
-    echo -e "  ${YELLOW}Каталог хранилищ ${REPO_DIR} НЕ удаляется${NC}"
+    echo -e "  ${YELLOW}Каталоги хранилищ /var/1c/repo-* НЕ удаляются${NC}"
     echo -e "  ${YELLOW}Каталог пакетов ${PACKAGES_DIR} НЕ удаляется${NC}"
     echo ""
     read -rp "  Введите 'DELETE' для подтверждения: " answer
@@ -997,17 +1712,27 @@ do_full_uninstall() {
         return
     fi
 
-    # Остановка и удаление службы
-    systemctl stop ${SERVICE_NAME} 2>/dev/null || true
-    if [[ -f /etc/systemd/system/${SERVICE_NAME}.service ]]; then
-        systemctl disable ${SERVICE_NAME} 2>/dev/null || true
-        rm -f /etc/systemd/system/${SERVICE_NAME}.service
-        systemctl daemon-reload
-        log_info "Служба удалена"
+    local n port
+    for n in "${INSTANCES[@]+"${INSTANCES[@]}"}"; do
+        systemctl stop "crserver@${n}.service" 2>/dev/null || true
+        systemctl disable "crserver@${n}.service" 2>/dev/null || true
+        port=$(awk -F'"' '/^REPO_PORT=/ {print $2; exit}' "${INSTANCES_DIR}/${n}.conf" 2>/dev/null || true)
+        [[ -n "$port" ]] && remove_input_for_port "$port"
+        cleanup_instance_chain "$n"
+    done
+
+    rm -f "$SERVICE_TEMPLATE_FILE"
+    systemctl daemon-reload
+
+    # Старый юнит на всякий случай
+    if [[ -f "$LEGACY_SERVICE_FILE" ]]; then
+        systemctl stop crserver.service 2>/dev/null || true
+        systemctl disable crserver.service 2>/dev/null || true
+        rm -f "$LEGACY_SERVICE_FILE"
     fi
 
-    # Удаление всех версий
-    for v in "${INSTALLED_VERSIONS[@]}"; do
+    local v
+    for v in "${INSTALLED_VERSIONS[@]+"${INSTALLED_VERSIONS[@]}"}"; do
         log_step "Удаление версии ${v}..."
         dpkg --purge "1c-enterprise-${v}-crs"    2>/dev/null || true
         dpkg --purge "1c-enterprise-${v}-ws"     2>/dev/null || true
@@ -1017,273 +1742,32 @@ do_full_uninstall() {
     apt-get autoremove -y -qq > /dev/null 2>&1 || true
     log_info "Пакеты удалены"
 
-    # Файрвол
     cleanup_firewall
     log_info "Правила файрвола очищены"
 
-    # Конфигурация
-    rm -f "$CONFIG_FILE"
-    rmdir "$(dirname "$CONFIG_FILE")" 2>/dev/null || true
+    rm -rf "$ETC_DIR"
 
     echo ""
     log_info "Удаление завершено"
-    echo -e "  ${YELLOW}Каталог ${REPO_DIR} сохранён. Удалите вручную если не нужен.${NC}"
+    echo -e "  ${YELLOW}Каталоги хранилищ /var/1c/repo-* сохранены. Удалите вручную если не нужны.${NC}"
     echo ""
 }
 
 # ============================================================================
-#  УПРАВЛЕНИЕ СЛУЖБОЙ
+#  УПРАВЛЕНИЕ СЛУЖБАМИ — МЕНЮ ВЕРХНЕГО УРОВНЯ
 # ============================================================================
 
 do_service_menu() {
-    while true; do
-        detect_active_version
-
-        local status_text status_color
-        if systemctl is-active --quiet ${SERVICE_NAME} 2>/dev/null; then
-            status_text="РАБОТАЕТ"
-            status_color="${GREEN}"
-        else
-            status_text="ОСТАНОВЛЕН"
-            status_color="${RED}"
-        fi
-
-        echo ""
-        echo -e "${BOLD}══════════════════════════════════════════════════${NC}"
-        echo -e "  Управление службой   Статус: ${status_color}${status_text}${NC}"
-        if [[ -n "$ACTIVE_VERSION" ]]; then
-            echo -e "  Версия: ${ACTIVE_VERSION}"
-        fi
-        echo -e "${BOLD}══════════════════════════════════════════════════${NC}"
-        echo ""
-        echo "  1) Запустить"
-        echo "  2) Остановить"
-        echo "  3) Перезапустить"
-        echo "  4) Подробный статус"
-        echo "  5) Просмотр логов (последние 50 строк)"
-        echo "  6) Логи в реальном времени (Ctrl+C для выхода)"
-        echo ""
-        echo "  0) ← Назад"
-        echo ""
-        read -rp "  Выберите: " choice
-
-        case $choice in
-            1)
-                if systemctl start ${SERVICE_NAME}; then
-                    log_info "Запущен"
-                else
-                    log_error "Ошибка запуска (journalctl -u ${SERVICE_NAME} -n 20)"
-                fi
-                sleep 1
-                ;;
-            2)
-                if systemctl stop ${SERVICE_NAME}; then
-                    log_info "Остановлен"
-                else
-                    log_error "Ошибка остановки"
-                fi
-                ;;
-            3)
-                if systemctl restart ${SERVICE_NAME}; then
-                    log_info "Перезапущен"
-                else
-                    log_error "Ошибка перезапуска (journalctl -u ${SERVICE_NAME} -n 20)"
-                fi
-                sleep 1
-                ;;
-            4)
-                echo ""
-                systemctl status ${SERVICE_NAME} --no-pager 2>/dev/null || log_warn "Служба не найдена"
-                echo ""
-                if ss -tlnp | grep -q ":${REPO_PORT}"; then
-                    log_info "Порт ${REPO_PORT} слушается"
-                else
-                    log_warn "Порт ${REPO_PORT} не слушается"
-                fi
-                echo ""
-                read -rp "  Нажмите Enter..." _
-                ;;
-            5)
-                echo ""
-                journalctl -u ${SERVICE_NAME} -n 50 --no-pager 2>/dev/null || log_warn "Нет логов"
-                echo ""
-                read -rp "  Нажмите Enter..." _
-                ;;
-            6)
-                echo ""
-                echo "  (Ctrl+C для выхода)"
-                journalctl -u ${SERVICE_NAME} -f 2>/dev/null || true
-                ;;
-            0) return ;;
-            *) log_warn "Неверный выбор" ;;
-        esac
-    done
+    if ! require_instance; then
+        return
+    fi
+    SELECTED_INSTANCE="$INST_NAME"
+    do_instance_service
 }
 
 # ============================================================================
-#  НАСТРОЙКА СЕРВЕРА
+#  ХРАНИЛИЩА КОНФИГУРАЦИЙ (REPO_DIR конкретного инстанса)
 # ============================================================================
-
-do_settings_menu() {
-    while true; do
-        load_config
-        detect_active_version
-
-        echo ""
-        echo -e "${BOLD}══════════════════════════════════════════════════${NC}"
-        echo -e "  Настройки сервера"
-        echo -e "${BOLD}══════════════════════════════════════════════════${NC}"
-        echo ""
-        echo "  Текущие параметры:"
-        echo "    Активная версия:   ${ACTIVE_VERSION:-не установлена}"
-        echo "    Порт:              ${REPO_PORT}"
-        echo "    Каталог хранилищ:  ${REPO_DIR}"
-        echo "    Каталог логов:     ${LOG_DIR}"
-        echo "    Каталог бэкапов:   ${BACKUP_DIR}"
-        echo "    Каталог пакетов:   ${PACKAGES_DIR}"
-        echo ""
-        echo "  1) Изменить порт"
-        echo "  2) Изменить каталог хранилищ"
-        echo "  3) Изменить каталог бэкапов"
-        echo "  4) Пересоздать systemd-службу"
-        echo ""
-        echo "  0) ← Назад"
-        echo ""
-        read -rp "  Выберите: " choice
-
-        case $choice in
-            1)
-                read -rp "  Новый порт [${REPO_PORT}]: " new_port
-                if [[ -n "$new_port" && "$new_port" =~ ^[0-9]+$ ]]; then
-                    REPO_PORT="$new_port"
-                    save_config
-                    regenerate_service
-                    log_info "Порт изменён на ${REPO_PORT}. Перезапустите службу."
-                fi
-                ;;
-            2)
-                read -rp "  Новый каталог [${REPO_DIR}]: " new_dir
-                if [[ -n "$new_dir" ]]; then
-                    REPO_DIR="$new_dir"
-                    detect_1c_user
-                    mkdir -p "$REPO_DIR"
-                    chown -R "${SVC_USER}:${SVC_GROUP}" "$REPO_DIR"
-                    save_config
-                    regenerate_service
-                    log_info "Каталог изменён. Перезапустите службу."
-                fi
-                ;;
-            3)
-                read -rp "  Новый каталог бэкапов [${BACKUP_DIR}]: " new_dir
-                if [[ -n "$new_dir" ]]; then
-                    BACKUP_DIR="$new_dir"
-                    mkdir -p "$BACKUP_DIR"
-                    save_config
-                    log_info "Каталог бэкапов: ${BACKUP_DIR}"
-                fi
-                ;;
-            4)
-                regenerate_service
-                log_info "Служба пересоздана. Перезапустите через меню управления."
-                read -rp "  Нажмите Enter..." _
-                ;;
-            0) return ;;
-            *) log_warn "Неверный выбор" ;;
-        esac
-    done
-}
-
-regenerate_service() {
-    # detect_active_version вызывается только если ACTIVE_VERSION/_BIN ещё не заданы,
-    # иначе мы потеряем ручное переключение, выполненное вызывающим кодом.
-    if [[ -z "${ACTIVE_VERSION:-}" || -z "${ACTIVE_CRSERVER_BIN:-}" ]]; then
-        detect_active_version
-    fi
-    detect_1c_user
-
-    local bin="${ACTIVE_CRSERVER_BIN:-}"
-    local ver="${ACTIVE_VERSION:-}"
-
-    if [[ -z "$bin" || ! -f "$bin" ]]; then
-        log_error "crserver не найден. Сначала установите версию."
-        return 1
-    fi
-
-    if [[ -z "$SVC_USER" || -z "$SVC_GROUP" ]]; then
-        log_error "Не определён системный пользователь 1С (usr1cv8)"
-        return 1
-    fi
-
-    # Валидация путей: должны быть абсолютными, без переносов строк
-    local p
-    for p in "$REPO_DIR" "$LOG_DIR"; do
-        if [[ -z "$p" || "$p" != /* || "$p" == *$'\n'* ]]; then
-            log_error "Некорректный путь в конфигурации: '${p}' (ожидается абсолютный путь)"
-            return 1
-        fi
-    done
-
-    if ! [[ "$REPO_PORT" =~ ^[0-9]+$ ]] || (( REPO_PORT < 1 || REPO_PORT > 65535 )); then
-        log_error "Некорректный порт: '${REPO_PORT}'"
-        return 1
-    fi
-
-    # Гарантируем существование каталогов, на которые ссылается ReadWritePaths,
-    # иначе systemd откажется стартовать юнит ("Failed to set up mount namespacing")
-    mkdir -p "$REPO_DIR" "$LOG_DIR" 2>/dev/null || true
-
-    cat > /etc/systemd/system/${SERVICE_NAME}.service << EOF
-[Unit]
-Description=1C:Enterprise Configuration Repository Server ${ver}
-Documentation=https://its.1c.ru
-After=network.target
-
-[Service]
-Type=simple
-User=${SVC_USER}
-Group=${SVC_GROUP}
-
-ExecStart=${bin} -d ${REPO_DIR} -port ${REPO_PORT}
-
-Restart=on-failure
-RestartSec=10
-TimeoutStopSec=30
-
-StandardOutput=journal
-StandardError=journal
-SyslogIdentifier=crserver
-
-NoNewPrivileges=yes
-ProtectSystem=strict
-ProtectHome=yes
-ReadWritePaths=${REPO_DIR} ${LOG_DIR}
-PrivateTmp=yes
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-    if ! systemctl daemon-reload; then
-        log_error "systemctl daemon-reload завершился с ошибкой"
-        return 1
-    fi
-    systemctl enable ${SERVICE_NAME} > /dev/null 2>&1 || \
-        log_warn "systemctl enable вернул ошибку (продолжаю)"
-    return 0
-}
-
-# ============================================================================
-#  УПРАВЛЕНИЕ ХРАНИЛИЩАМИ
-# ============================================================================
-#
-# Хранилище 1С на сервере — это подкаталог в REPO_DIR/<имя>/. Внутри
-# присутствуют файлы вроде 1cv8ddb.lst, cache/, data/. Их структуру создаёт
-# и поддерживает конфигуратор 1С при первом подключении / работе.
-#
-# Скрипт умеет только файловые операции: создать пустой каталог-заготовку,
-# удалить, переименовать, бэкапить/восстанавливать конкретное хранилище,
-# показывать инфо. Создание структуры (инициализация хранилища) и работа
-# с историей версий — задача конфигуратора 1С.
 
 # Имя хранилища: только латиница/цифры/_/- , 1..64 символа
 validate_repo_name() {
@@ -1294,24 +1778,21 @@ validate_repo_name() {
     return 0
 }
 
-# Возвращает массив существующих хранилищ через имя массива
-# Использование: get_repo_list arr_name
+# Заполняет массив (имя массива в $1) подкаталогами в INST_REPO_DIR
 get_repo_list() {
     local _out_var="$1"
     local _result=()
-    if [[ -d "$REPO_DIR" ]]; then
+    if [[ -d "$INST_REPO_DIR" ]]; then
         local _dir
-        for _dir in "$REPO_DIR"/*/; do
+        for _dir in "$INST_REPO_DIR"/*/; do
             [[ -d "$_dir" ]] || continue
             _result+=("$(basename "$_dir")")
         done
     fi
-    # Передаём массив через namedref
     local -n _ref="$_out_var"
     _ref=("${_result[@]+"${_result[@]}"}")
 }
 
-# Признаки «непустого» хранилища 1С — наличие хотя бы одного из файлов
 repo_looks_initialized() {
     local dir="$1"
     [[ -f "$dir/1cv8ddb.lst" ]] && return 0
@@ -1322,6 +1803,9 @@ repo_looks_initialized() {
 }
 
 do_repo_menu() {
+    if ! require_instance; then
+        return
+    fi
     while true; do
         local repos=()
         get_repo_list repos
@@ -1330,9 +1814,10 @@ do_repo_menu() {
 
         echo ""
         echo -e "${BOLD}══════════════════════════════════════════════════${NC}"
-        echo -e "  Хранилища конфигураций"
+        echo -e "  Хранилища (инстанс: ${CYAN}${INST_NAME}${NC})"
         echo -e "${BOLD}══════════════════════════════════════════════════${NC}"
-        echo "  Каталог: ${REPO_DIR}"
+        echo "  Каталог: ${INST_REPO_DIR}"
+        echo "  Порт:    ${INST_PORT}"
         echo ""
 
         if [[ ${#repos[@]} -eq 0 ]]; then
@@ -1343,20 +1828,20 @@ do_repo_menu() {
             local idx=0 r size status
             for r in "${repos[@]}"; do
                 idx=$((idx + 1))
-                size=$(du -sh "${REPO_DIR}/${r}" 2>/dev/null | awk '{print $1}')
-                if repo_looks_initialized "${REPO_DIR}/${r}"; then
+                size=$(du -sh "${INST_REPO_DIR}/${r}" 2>/dev/null | awk '{print $1}')
+                if repo_looks_initialized "${INST_REPO_DIR}/${r}"; then
                     status="${GREEN}init${NC}"
                 else
                     status="${YELLOW}пусто${NC}"
                 fi
                 echo -e "    ${idx}) ${r}  [${size:-?}]  (${status})"
-                echo "       → tcp://${ip_addr}:${REPO_PORT}/${r}"
+                echo "       → tcp://${ip_addr}:${INST_PORT}/${r}"
             done
         fi
 
         echo ""
-        echo "  1) Подробный список (с числом файлов и датой)"
-        echo "  2) Подготовить новое хранилище (пустой каталог)"
+        echo "  1) Подробный список"
+        echo "  2) Подготовить новое хранилище"
         echo "  3) Информация о хранилище"
         echo "  4) Переименовать хранилище"
         echo "  5) Удалить хранилище"
@@ -1399,7 +1884,7 @@ do_repo_list_detailed() {
     echo "  ─────────────────────────────────────────────────────────────────────"
     local r dir size files mtime status
     for r in "${repos[@]}"; do
-        dir="${REPO_DIR}/${r}"
+        dir="${INST_REPO_DIR}/${r}"
         size=$(du -sh "$dir" 2>/dev/null | awk '{print $1}')
         files=$(find "$dir" -type f 2>/dev/null | wc -l)
         mtime=$(stat -c '%y' "$dir" 2>/dev/null | cut -d. -f1 | cut -d' ' -f1)
@@ -1411,25 +1896,24 @@ do_repo_list_detailed() {
         printf "  %-24s %8s %8s %12s  %s\n" "$r" "${size:-?}" "${files:-0}" "${mtime:-?}" "$status"
     done
     echo ""
-    echo "  Подключение из конфигуратора:"
-    echo "    tcp://${ip_addr}:${REPO_PORT}/<имя>"
+    echo "  Подключение: tcp://${ip_addr}:${INST_PORT}/<имя>"
 }
 
 do_repo_create() {
     echo ""
-    read -rp "  Имя нового хранилища (латиница/цифры/_-, до 64 символов): " name
+    read -rp "  Имя нового хранилища: " name
     if ! validate_repo_name "$name"; then
         log_error "Недопустимое имя"
         return 1
     fi
-    local dir="${REPO_DIR}/${name}"
+    local dir="${INST_REPO_DIR}/${name}"
     if [[ -e "$dir" ]]; then
-        log_error "Хранилище с таким именем уже существует: ${dir}"
+        log_error "Уже существует: ${dir}"
         return 1
     fi
 
     detect_1c_user
-    if [[ -z "$SVC_USER" || -z "$SVC_GROUP" ]]; then
+    if [[ -z "${SVC_USER:-}" || -z "${SVC_GROUP:-}" ]]; then
         log_error "Не определён пользователь usr1cv8 — выполните установку"
         return 1
     fi
@@ -1437,19 +1921,16 @@ do_repo_create() {
     mkdir -p "$dir"
     chown "${SVC_USER}:${SVC_GROUP}" "$dir"
     chmod 750 "$dir"
-
     log_info "Каталог создан: ${dir}"
+
     echo ""
-    echo "  Это пустая ЗАГОТОВКА. Структура хранилища создаётся конфигуратором"
-    echo "  при первом подключении:"
-    echo ""
-    echo "    Конфигурация → Хранилище конфигурации → Создать хранилище"
+    echo "  Это пустая ЗАГОТОВКА. Структура создаётся конфигуратором при"
+    echo "  первом подключении: Конфигурация → Хранилище конфигурации → Создать."
     local ip_addr
     ip_addr=$(get_primary_ip)
-    echo "    Адрес: tcp://${ip_addr}:${REPO_PORT}/${name}"
+    echo "    Адрес: tcp://${ip_addr}:${INST_PORT}/${name}"
 }
 
-# Возвращает имя хранилища через переменную repo_chosen, либо ""
 _select_repo_interactive() {
     repo_chosen=""
     local repos=()
@@ -1481,15 +1962,15 @@ _select_repo_interactive() {
 do_repo_info() {
     local repo_chosen=""
     _select_repo_interactive || return
-    local dir="${REPO_DIR}/${repo_chosen}"
+    local dir="${INST_REPO_DIR}/${repo_chosen}"
     local ip_addr
     ip_addr=$(get_primary_ip)
 
     echo ""
-    echo "  Информация о хранилище '${repo_chosen}'"
+    echo "  Хранилище '${repo_chosen}' (инстанс ${INST_NAME})"
     echo "  ─────────────────────────────────────────────"
     echo "    Путь:       ${dir}"
-    echo "    Адрес:      tcp://${ip_addr}:${REPO_PORT}/${repo_chosen}"
+    echo "    Адрес:      tcp://${ip_addr}:${INST_PORT}/${repo_chosen}"
     echo "    Размер:     $(du -sh "$dir" 2>/dev/null | awk '{print $1}')"
     echo "    Файлов:     $(find "$dir" -type f 2>/dev/null | wc -l)"
     echo "    Каталогов:  $(find "$dir" -type d 2>/dev/null | wc -l)"
@@ -1502,11 +1983,10 @@ do_repo_info() {
         echo "    Статус:     пустая заготовка"
     fi
 
-    # Активные подключения к порту (грубо — все, не различим конкретное хранилище)
     if command -v ss >/dev/null 2>&1; then
         local conns
-        conns=$(ss -tn 2>/dev/null | awk -v p=":${REPO_PORT}" '$0 ~ p && $1=="ESTAB" {print}' | wc -l)
-        echo "    Активных подключений к порту ${REPO_PORT}: ${conns}"
+        conns=$(ss -tn 2>/dev/null | awk -v p=":${INST_PORT}" '$0 ~ p && $1=="ESTAB" {print}' | wc -l)
+        echo "    Активных подключений к порту ${INST_PORT}: ${conns}"
     fi
 }
 
@@ -1514,11 +1994,11 @@ do_repo_rename() {
     local repo_chosen=""
     _select_repo_interactive || return
     local old_name="$repo_chosen"
-    local old_dir="${REPO_DIR}/${old_name}"
+    local old_dir="${INST_REPO_DIR}/${old_name}"
 
     echo ""
     log_warn "Переименование разорвёт URL подключения у клиентов!"
-    echo "    Было:   tcp://...:${REPO_PORT}/${old_name}"
+    echo "    Было:   tcp://...:${INST_PORT}/${old_name}"
     read -rp "  Новое имя: " new_name
     if ! validate_repo_name "$new_name"; then
         log_error "Недопустимое имя"
@@ -1528,52 +2008,52 @@ do_repo_rename() {
         log_warn "Имя не изменилось"
         return
     fi
-    local new_dir="${REPO_DIR}/${new_name}"
+    local new_dir="${INST_REPO_DIR}/${new_name}"
     if [[ -e "$new_dir" ]]; then
-        log_error "Хранилище с таким именем уже существует"
+        log_error "Уже существует"
         return 1
     fi
 
-    # Останавливаем службу — переименование на горячую может повредить открытые сессии
+    local unit="crserver@${INST_NAME}.service"
     local was_active=0
-    if systemctl is-active --quiet ${SERVICE_NAME} 2>/dev/null; then
+    if systemctl is-active --quiet "$unit" 2>/dev/null; then
         was_active=1
-        log_step "Остановка службы..."
-        systemctl stop ${SERVICE_NAME} 2>/dev/null || true
+        log_step "Остановка ${unit}..."
+        systemctl stop "$unit" 2>/dev/null || true
         sleep 1
     fi
 
     if ! mv "$old_dir" "$new_dir"; then
         log_error "mv не удался"
         if [[ $was_active -eq 1 ]]; then
-            systemctl start ${SERVICE_NAME} 2>/dev/null || true
+            systemctl start "$unit" 2>/dev/null || true
         fi
         return 1
     fi
 
     if [[ $was_active -eq 1 ]]; then
-        systemctl start ${SERVICE_NAME} 2>/dev/null || \
-            log_warn "Служба не стартовала — проверьте journalctl"
+        systemctl start "$unit" 2>/dev/null || \
+            log_warn "Служба не стартовала — journalctl -u ${unit}"
     fi
 
     local ip_addr
     ip_addr=$(get_primary_ip)
     log_info "Переименовано: ${old_name} → ${new_name}"
-    echo "    Стало: tcp://${ip_addr}:${REPO_PORT}/${new_name}"
+    echo "    Стало: tcp://${ip_addr}:${INST_PORT}/${new_name}"
 }
 
 do_repo_delete() {
     local repo_chosen=""
     _select_repo_interactive || return
     local name="$repo_chosen"
-    local dir="${REPO_DIR}/${name}"
+    local dir="${INST_REPO_DIR}/${name}"
 
     echo ""
     echo "  Будет УДАЛЁН каталог:"
     echo "    ${dir}"
     echo "  Размер: $(du -sh "$dir" 2>/dev/null | awk '{print $1}')"
     echo ""
-    log_warn "Это необратимо. Рекомендуется сначала сделать бэкап (пункт 6)."
+    log_warn "Это необратимо. Рекомендуется сначала сделать бэкап."
     echo ""
     read -rp "  Введите имя хранилища '${name}' для подтверждения: " confirm
     if [[ "$confirm" != "$name" ]]; then
@@ -1581,27 +2061,27 @@ do_repo_delete() {
         return
     fi
 
-    # Останавливаем службу
+    local unit="crserver@${INST_NAME}.service"
     local was_active=0
-    if systemctl is-active --quiet ${SERVICE_NAME} 2>/dev/null; then
+    if systemctl is-active --quiet "$unit" 2>/dev/null; then
         was_active=1
-        log_step "Остановка службы..."
-        systemctl stop ${SERVICE_NAME} 2>/dev/null || true
+        log_step "Остановка ${unit}..."
+        systemctl stop "$unit" 2>/dev/null || true
         sleep 1
     fi
 
     if ! rm -rf "$dir"; then
         log_error "rm -rf завершился с ошибкой"
         if [[ $was_active -eq 1 ]]; then
-            systemctl start ${SERVICE_NAME} 2>/dev/null || true
+            systemctl start "$unit" 2>/dev/null || true
         fi
         return 1
     fi
     log_info "Удалено: ${name}"
 
     if [[ $was_active -eq 1 ]]; then
-        systemctl start ${SERVICE_NAME} 2>/dev/null || \
-            log_warn "Служба не стартовала — проверьте journalctl"
+        systemctl start "$unit" 2>/dev/null || \
+            log_warn "Служба не стартовала — journalctl -u ${unit}"
     fi
 }
 
@@ -1609,14 +2089,13 @@ do_repo_backup() {
     local repo_chosen=""
     _select_repo_interactive || return
     local name="$repo_chosen"
-    local src="${REPO_DIR}/${name}"
+    local src="${INST_REPO_DIR}/${name}"
 
     mkdir -p "$BACKUP_DIR"
     local timestamp
     timestamp=$(date +%Y%m%d_%H%M%S)
-    local archive="${BACKUP_DIR}/repo_${name}_${timestamp}.tar.gz"
+    local archive="${BACKUP_DIR}/${INST_NAME}_repo_${name}_${timestamp}.tar.gz"
 
-    # Опционально приостановить службу для консистентного снимка
     local stop_service=0
     echo ""
     read -rp "  Остановить службу на время бэкапа (рекомендуется)? (Y/n): " ans
@@ -1624,21 +2103,22 @@ do_repo_backup() {
         stop_service=1
     fi
 
+    local unit="crserver@${INST_NAME}.service"
     local was_active=0
-    if [[ $stop_service -eq 1 ]] && systemctl is-active --quiet ${SERVICE_NAME} 2>/dev/null; then
+    if [[ $stop_service -eq 1 ]] && systemctl is-active --quiet "$unit" 2>/dev/null; then
         was_active=1
-        log_step "Остановка службы..."
-        systemctl stop ${SERVICE_NAME} 2>/dev/null || true
+        log_step "Остановка ${unit}..."
+        systemctl stop "$unit" 2>/dev/null || true
         sleep 1
     fi
 
     log_step "Создание архива ${archive}..."
-    if ! tar -czf "$archive" -C "$REPO_DIR" "$name" 2>/tmp/crserver-tar.log; then
+    if ! tar -czf "$archive" -C "$INST_REPO_DIR" "$name" 2>/tmp/crserver-tar.log; then
         log_error "tar завершился с ошибкой:"
         tail -5 /tmp/crserver-tar.log | sed 's/^/    /'
         rm -f /tmp/crserver-tar.log "$archive"
         if [[ $was_active -eq 1 ]]; then
-            systemctl start ${SERVICE_NAME} 2>/dev/null || true
+            systemctl start "$unit" 2>/dev/null || true
         fi
         return 1
     fi
@@ -1649,8 +2129,8 @@ do_repo_backup() {
     log_info "Бэкап создан: ${archive} [${size:-?}]"
 
     if [[ $was_active -eq 1 ]]; then
-        systemctl start ${SERVICE_NAME} 2>/dev/null || \
-            log_warn "Служба не стартовала — проверьте journalctl"
+        systemctl start "$unit" 2>/dev/null || \
+            log_warn "Служба не стартовала — journalctl -u ${unit}"
     fi
 }
 
@@ -1660,14 +2140,14 @@ do_repo_restore() {
         return
     fi
 
-    # Только архивы вида repo_<имя>_<timestamp>.tar.gz
+    # Бэкапы для текущего инстанса: <inst>_repo_<имя>_<ts>.tar.gz
     local backups=()
     local f
-    for f in "$BACKUP_DIR"/repo_*.tar.gz; do
+    for f in "$BACKUP_DIR"/${INST_NAME}_repo_*.tar.gz; do
         [[ -f "$f" ]] && backups+=("$f")
     done
     if [[ ${#backups[@]} -eq 0 ]]; then
-        log_warn "Нет бэкапов отдельных хранилищ (repo_*.tar.gz) в ${BACKUP_DIR}"
+        log_warn "Нет бэкапов отдельных хранилищ для инстанса ${INST_NAME}"
         echo "  Создайте сначала через пункт 6."
         return
     fi
@@ -1691,7 +2171,6 @@ do_repo_restore() {
     fi
 
     local archive="${backups[$((num - 1))]}"
-    # Имя хранилища = верхний каталог в архиве
     local name
     name=$(tar -tzf "$archive" 2>/dev/null | head -1 | cut -d/ -f1)
     if [[ -z "$name" ]]; then
@@ -1702,7 +2181,7 @@ do_repo_restore() {
     echo ""
     echo "  Архив:      $(basename "$archive")"
     echo "  Хранилище:  ${name}"
-    local target="${REPO_DIR}/${name}"
+    local target="${INST_REPO_DIR}/${name}"
     if [[ -e "$target" ]]; then
         echo ""
         log_warn "Хранилище '${name}' уже существует и БУДЕТ ЗАМЕНЕНО"
@@ -1713,16 +2192,15 @@ do_repo_restore() {
         fi
     fi
 
-    # Останавливаем службу
+    local unit="crserver@${INST_NAME}.service"
     local was_active=0
-    if systemctl is-active --quiet ${SERVICE_NAME} 2>/dev/null; then
+    if systemctl is-active --quiet "$unit" 2>/dev/null; then
         was_active=1
-        log_step "Остановка службы..."
-        systemctl stop ${SERVICE_NAME} 2>/dev/null || true
+        log_step "Остановка ${unit}..."
+        systemctl stop "$unit" 2>/dev/null || true
         sleep 1
     fi
 
-    # Если каталог уже есть — переименовываем как .pre-restore.<ts>, чтобы откатить
     local rollback_dir=""
     if [[ -e "$target" ]]; then
         rollback_dir="${target}.pre-restore.$(date +%s)"
@@ -1730,37 +2208,35 @@ do_repo_restore() {
     fi
 
     log_step "Распаковка архива..."
-    if ! tar -xzf "$archive" -C "$REPO_DIR" 2>/tmp/crserver-tar.log; then
+    if ! tar -xzf "$archive" -C "$INST_REPO_DIR" 2>/tmp/crserver-tar.log; then
         log_error "Ошибка распаковки:"
         tail -5 /tmp/crserver-tar.log | sed 's/^/    /'
         rm -f /tmp/crserver-tar.log
-        # Откат
         if [[ -n "$rollback_dir" ]]; then
             log_warn "Восстанавливаю предыдущее состояние..."
             rm -rf "$target" 2>/dev/null || true
             mv "$rollback_dir" "$target"
         fi
         if [[ $was_active -eq 1 ]]; then
-            systemctl start ${SERVICE_NAME} 2>/dev/null || true
+            systemctl start "$unit" 2>/dev/null || true
         fi
         return 1
     fi
     rm -f /tmp/crserver-tar.log
 
     detect_1c_user
-    if [[ -n "$SVC_USER" && -n "$SVC_GROUP" ]]; then
+    if [[ -n "${SVC_USER:-}" && -n "${SVC_GROUP:-}" ]]; then
         chown -R "${SVC_USER}:${SVC_GROUP}" "$target"
     fi
 
     log_info "Восстановлено: ${name}"
     if [[ -n "$rollback_dir" ]]; then
         echo "  Прежний вариант сохранён: ${rollback_dir}"
-        echo "  Удалите его вручную, если новый бэкап работает корректно."
     fi
 
     if [[ $was_active -eq 1 ]]; then
-        systemctl start ${SERVICE_NAME} 2>/dev/null || \
-            log_warn "Служба не стартовала — проверьте journalctl"
+        systemctl start "$unit" 2>/dev/null || \
+            log_warn "Служба не стартовала — journalctl -u ${unit}"
     fi
 }
 
@@ -1768,7 +2244,7 @@ do_repo_check() {
     local repo_chosen=""
     _select_repo_interactive || return
     local name="$repo_chosen"
-    local dir="${REPO_DIR}/${name}"
+    local dir="${INST_REPO_DIR}/${name}"
     local issues=0
 
     echo ""
@@ -1797,28 +2273,22 @@ do_repo_check() {
         log_info "Структура: похоже на инициализированное хранилище"
     else
         log_warn "Структура: пусто/не инициализировано"
-        echo "    Подключитесь конфигуратором и создайте хранилище:"
-        echo "      Конфигурация → Хранилище конфигурации → Создать"
         issues=$((issues + 1))
     fi
 
-    # Чужие файлы внутри (часто признак mv от другого пользователя)
     local foreign
     foreign=$(find "$dir" ! -user "$SVC_USER" 2>/dev/null | head -3)
     if [[ -n "$foreign" ]]; then
         log_warn "Найдены файлы НЕ принадлежащие ${SVC_USER}:"
         echo "$foreign" | sed 's/^/    /'
-        echo "    Исправить: chown -R ${SVC_USER}:${SVC_GROUP} ${dir}"
         issues=$((issues + 1))
     fi
 
-    # Lock-файлы (могут остаться от аварийного завершения)
     local locks
     locks=$(find "$dir" -maxdepth 2 -name "*.lck" -o -name "*.lock" 2>/dev/null | head -3)
     if [[ -n "$locks" ]]; then
         log_warn "Найдены lock-файлы:"
         echo "$locks" | sed 's/^/    /'
-        echo "    Если служба остановлена — можно удалить вручную."
     fi
 
     echo ""
@@ -1830,43 +2300,41 @@ do_repo_check() {
 }
 
 # ============================================================================
-#  УПРАВЛЕНИЕ ДОСТУПОМ (ФАЙРВОЛ)
+#  ФАЙРВОЛ
 # ============================================================================
-
-# ──────────────────────────────────────────────────────────────────────────
-# МОДЕЛЬ ЦЕПОЧКИ:
-#   1. ACCEPT loopback (всегда)
-#   2..N-1. ACCEPT для разрешённых IP/подсетей (добавляются пользователем)
-#   N.  ПОЛИСИ-ПРАВИЛО (последнее):
-#         ACCEPT (открытый режим)  — порт открыт всем
-#         DROP   (whitelist режим) — пускаем только разрешённых
 #
-# Все вставки IP выполняются ПЕРЕД полиси-правилом.
-# Подсчёт правил для индекса вставки берётся через -S (reliable) и пропускает
-# заголовочные строки.
-# ──────────────────────────────────────────────────────────────────────────
+# МОДЕЛЬ:
+#   * Цепочка CRSERVER — общая для ВСЕХ инстансов (глобальный whitelist).
+#     Структура: ACCEPT 127.0.0.1; <разрешённые IP/подсети>; финальное
+#     полиси-правило ACCEPT (open) или DROP (whitelist).
+#   * Цепочка CRSERVER-<имя> — опциональные пер-инстанс правила. Если в
+#     ней есть хотя бы одно ACCEPT, INPUT-правило для порта прыгает И в
+#     CRSERVER, И в CRSERVER-<имя>. Если цепочки нет — только в CRSERVER.
+#   * INPUT для каждого порта инстанса: -p tcp --dport <port> -j CRSERVER
+#     (плюс -j CRSERVER-<имя> при наличии).
 
 setup_firewall_chain() {
     iptables -N "$IPTABLES_CHAIN" 2>/dev/null || iptables -F "$IPTABLES_CHAIN"
     iptables -A "$IPTABLES_CHAIN" -s 127.0.0.1 -j ACCEPT
-    # По умолчанию — открытый режим: финальное правило ACCEPT
     iptables -A "$IPTABLES_CHAIN" -j ACCEPT
-    iptables -C INPUT -p tcp --dport "$REPO_PORT" -j "$IPTABLES_CHAIN" 2>/dev/null || \
-        iptables -A INPUT -p tcp --dport "$REPO_PORT" -j "$IPTABLES_CHAIN"
     save_iptables
 }
 
 ensure_firewall_chain() {
     if ! iptables -L "$IPTABLES_CHAIN" -n &>/dev/null; then
         setup_firewall_chain
-        return
     fi
-    iptables -C INPUT -p tcp --dport "$REPO_PORT" -j "$IPTABLES_CHAIN" 2>/dev/null || \
-        iptables -A INPUT -p tcp --dport "$REPO_PORT" -j "$IPTABLES_CHAIN"
 }
 
 cleanup_firewall() {
-    iptables -D INPUT -p tcp --dport "$REPO_PORT" -j "$IPTABLES_CHAIN" 2>/dev/null || true
+    # Удаляем INPUT-правила всех инстансов
+    instance_list
+    local n port
+    for n in "${INSTANCES[@]+"${INSTANCES[@]}"}"; do
+        port=$(awk -F'"' '/^REPO_PORT=/ {print $2; exit}' "${INSTANCES_DIR}/${n}.conf" 2>/dev/null || true)
+        [[ -n "$port" ]] && remove_input_for_port "$port"
+        cleanup_instance_chain "$n"
+    done
     iptables -F "$IPTABLES_CHAIN" 2>/dev/null || true
     iptables -X "$IPTABLES_CHAIN" 2>/dev/null || true
     save_iptables
@@ -1878,12 +2346,32 @@ save_iptables() {
     fi
 }
 
-# Возвращает количество правил в цепочке (по выводу -S, без -N строки)
+# Добавляет INPUT-правила для порта (CRSERVER + CRSERVER-<инст>, если цепочка есть).
+add_input_for_port() {
+    local port="$1"
+    [[ -z "$port" ]] && return 1
+    ensure_firewall_chain
+    iptables -C INPUT -p tcp --dport "$port" -j "$IPTABLES_CHAIN" 2>/dev/null || \
+        iptables -A INPUT -p tcp --dport "$port" -j "$IPTABLES_CHAIN"
+    save_iptables
+    return 0
+}
+
+remove_input_for_port() {
+    local port="$1"
+    [[ -z "$port" ]] && return 1
+    while iptables -C INPUT -p tcp --dport "$port" -j "$IPTABLES_CHAIN" 2>/dev/null; do
+        iptables -D INPUT -p tcp --dport "$port" -j "$IPTABLES_CHAIN" 2>/dev/null || break
+    done
+    # Per-instance ссылки удаляются в cleanup_instance_chain — здесь только общая
+    save_iptables
+    return 0
+}
+
 chain_rule_count() {
     iptables -S "$IPTABLES_CHAIN" 2>/dev/null | grep -c '^-A ' || true
 }
 
-# Возвращает текущий полиси-режим: "whitelist" | "open" | "unknown"
 current_policy_mode() {
     local last
     last=$(iptables -S "$IPTABLES_CHAIN" 2>/dev/null | grep '^-A ' | tail -1 || true)
@@ -1896,15 +2384,11 @@ current_policy_mode() {
     fi
 }
 
-# Заменяет финальное полиси-правило (DROP <-> ACCEPT-all)
 set_policy_mode() {
-    local mode="$1"  # whitelist | open
+    local mode="$1"
     ensure_firewall_chain
-
-    # Удаляем все возможные финальные полиси-правила
     iptables -D "$IPTABLES_CHAIN" -j ACCEPT 2>/dev/null || true
     iptables -D "$IPTABLES_CHAIN" -j DROP   2>/dev/null || true
-
     case "$mode" in
         whitelist) iptables -A "$IPTABLES_CHAIN" -j DROP ;;
         open)      iptables -A "$IPTABLES_CHAIN" -j ACCEPT ;;
@@ -1912,11 +2396,96 @@ set_policy_mode() {
     save_iptables
 }
 
+validate_ip() {
+    local ip="$1"
+    [[ "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] && return 0
+    [[ "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+/[0-9]+$ ]] && return 0
+    return 1
+}
+
+add_allowed_ip() {
+    local ip="$1"
+    ensure_firewall_chain
+    if iptables -C "$IPTABLES_CHAIN" -s "$ip" -j ACCEPT 2>/dev/null; then
+        log_warn "IP $ip уже в списке"
+        return
+    fi
+    local total
+    total=$(chain_rule_count)
+    if [[ $total -ge 1 ]]; then
+        iptables -I "$IPTABLES_CHAIN" "$total" -s "$ip" -j ACCEPT
+    else
+        iptables -A "$IPTABLES_CHAIN" -s "$ip" -j ACCEPT
+    fi
+    save_iptables
+}
+
+enable_whitelist_mode() {
+    ensure_firewall_chain
+    if [[ "$(current_policy_mode)" == "whitelist" ]]; then
+        log_warn "Режим белого списка уже включён"
+        return
+    fi
+    set_policy_mode whitelist
+}
+
+# Per-instance цепочка: CRSERVER-<имя>. Структура такая же, но без финального
+# полиси-правила (политика общая в CRSERVER).
+instance_chain_name() {
+    echo "CRSERVER-$1"
+}
+
+setup_instance_chain() {
+    local name="$1"
+    local chain
+    chain=$(instance_chain_name "$name")
+    iptables -N "$chain" 2>/dev/null || iptables -F "$chain"
+    iptables -A "$chain" -s 127.0.0.1 -j ACCEPT
+    save_iptables
+}
+
+cleanup_instance_chain() {
+    local name="$1"
+    local chain port
+    chain=$(instance_chain_name "$name")
+    port=$(awk -F'"' '/^REPO_PORT=/ {print $2; exit}' "${INSTANCES_DIR}/${name}.conf" 2>/dev/null || true)
+    if [[ -n "$port" ]]; then
+        while iptables -C INPUT -p tcp --dport "$port" -j "$chain" 2>/dev/null; do
+            iptables -D INPUT -p tcp --dport "$port" -j "$chain" 2>/dev/null || break
+        done
+    fi
+    iptables -F "$chain" 2>/dev/null || true
+    iptables -X "$chain" 2>/dev/null || true
+    save_iptables
+}
+
+add_allowed_ip_for_instance() {
+    local name="$1" ip="$2"
+    local chain
+    chain=$(instance_chain_name "$name")
+    if ! iptables -L "$chain" -n &>/dev/null; then
+        setup_instance_chain "$name"
+        # Подцепляем INPUT
+        local port
+        port=$(awk -F'"' '/^REPO_PORT=/ {print $2; exit}' "${INSTANCES_DIR}/${name}.conf" 2>/dev/null || true)
+        if [[ -n "$port" ]]; then
+            iptables -C INPUT -p tcp --dport "$port" -j "$chain" 2>/dev/null || \
+                iptables -I INPUT 1 -p tcp --dport "$port" -j "$chain"
+        fi
+    fi
+    if iptables -C "$chain" -s "$ip" -j ACCEPT 2>/dev/null; then
+        log_warn "IP $ip уже в списке инстанса"
+        return
+    fi
+    iptables -A "$chain" -s "$ip" -j ACCEPT
+    save_iptables
+}
+
 do_access_menu() {
     while true; do
         echo ""
         echo -e "${BOLD}══════════════════════════════════════════════════${NC}"
-        echo -e "  Управление доступом (файрвол)"
+        echo -e "  Файрвол (общая цепочка ${IPTABLES_CHAIN})"
         echo -e "${BOLD}══════════════════════════════════════════════════${NC}"
         echo ""
 
@@ -1925,18 +2494,32 @@ do_access_menu() {
         echo -n "  Режим: "
         case "$mode" in
             whitelist) echo -e "${YELLOW}БЕЛЫЙ СПИСОК${NC} (доступ только для разрешённых IP)" ;;
-            open)      echo -e "${GREEN}ОТКРЫТЫЙ${NC} (порт ${REPO_PORT} доступен всем)" ;;
-            *)         echo -e "${RED}не настроен${NC} (создайте через установку)" ;;
+            open)      echo -e "${GREEN}ОТКРЫТЫЙ${NC} (порты доступны всем)" ;;
+            *)         echo -e "${RED}не настроен${NC}" ;;
         esac
 
-        echo ""
-        echo "  Правила для порта ${REPO_PORT}:"
-        echo "  ─────────────────────────────────────────────"
+        # Перечисляем порты инстансов
+        instance_list
+        if [[ ${#INSTANCES[@]} -gt 0 ]]; then
+            echo ""
+            echo "  Защищённые порты:"
+            local n p
+            for n in "${INSTANCES[@]}"; do
+                p=$(awk -F'"' '/^REPO_PORT=/ {print $2; exit}' "${INSTANCES_DIR}/${n}.conf" 2>/dev/null || true)
+                local protected="нет"
+                if iptables -C INPUT -p tcp --dport "$p" -j "$IPTABLES_CHAIN" 2>/dev/null; then
+                    protected="да"
+                fi
+                echo "    ${n}  port=${p}  → CRSERVER: ${protected}"
+            done
+        fi
 
+        echo ""
+        echo "  Правила в общей цепочке:"
+        echo "  ─────────────────────────────────────────────"
         if iptables -L "$IPTABLES_CHAIN" -n --line-numbers 2>/dev/null | grep -qE '^[0-9]+ +(ACCEPT|DROP)'; then
             local line num action src color desc
             while IFS= read -r line; do
-                # колонки: num target prot opt source destination ...
                 num=$(awk '{print $1}'   <<< "$line")
                 action=$(awk '{print $2}' <<< "$line")
                 src=$(awk '{print $5}'    <<< "$line")
@@ -1947,16 +2530,17 @@ do_access_menu() {
                 echo -e "    [${num}] ${color}${action}${NC}  ←  ${desc}"
             done < <(iptables -L "$IPTABLES_CHAIN" -n --line-numbers 2>/dev/null | grep -E '^[0-9]+ +(ACCEPT|DROP)')
         else
-            echo "    (цепочка не создана — выполните установку)"
+            echo "    (цепочка не создана)"
         fi
 
         echo ""
-        echo "  1) Добавить разрешённый IP"
-        echo "  2) Добавить разрешённую подсеть"
-        echo "  3) Включить режим белого списка (заблокировать всех остальных)"
-        echo "  4) Открыть порт для всех (снять ограничения)"
-        echo "  5) Удалить правило по номеру (см. [N] выше)"
-        echo "  6) Показать мой внешний IP (curl ifconfig.me)"
+        echo "  1) Добавить разрешённый IP (общий список)"
+        echo "  2) Добавить разрешённую подсеть (общий список)"
+        echo "  3) Включить режим белого списка"
+        echo "  4) Открыть порты для всех (снять ограничения)"
+        echo "  5) Удалить правило по номеру"
+        echo "  6) Показать мой внешний IP"
+        echo "  7) Пер-инстанс правила (CRSERVER-<имя>)"
         echo ""
         echo "  0) ← Назад"
         echo ""
@@ -1967,9 +2551,9 @@ do_access_menu() {
                 read -rp "  IP-адрес: " ip
                 if validate_ip "$ip"; then
                     add_allowed_ip "$ip"
-                    log_info "IP $ip добавлен в разрешённые"
+                    log_info "IP $ip добавлен"
                 else
-                    log_error "Некорректный IP-адрес"
+                    log_error "Некорректный IP"
                 fi
                 ;;
             2)
@@ -1978,7 +2562,7 @@ do_access_menu() {
                     add_allowed_ip "$subnet"
                     log_info "Подсеть $subnet добавлена"
                 else
-                    log_error "Некорректный формат подсети"
+                    log_error "Некорректный формат"
                 fi
                 ;;
             3)
@@ -1992,10 +2576,10 @@ do_access_menu() {
                 ;;
             4)
                 set_policy_mode open
-                log_info "Порт ${REPO_PORT} открыт для всех"
+                log_info "Открыто для всех"
                 ;;
             5)
-                read -rp "  Номер правила для удаления: " rule_num
+                read -rp "  Номер правила: " rule_num
                 if [[ "$rule_num" =~ ^[0-9]+$ ]]; then
                     ensure_firewall_chain
                     if iptables -D "$IPTABLES_CHAIN" "$rule_num" 2>/dev/null; then
@@ -2013,8 +2597,64 @@ do_access_menu() {
                 echo -n "  Внешний IP: "
                 curl -s --max-time 5 ifconfig.me 2>/dev/null || echo "(не удалось определить)"
                 echo ""
-                echo ""
                 read -rp "  Нажмите Enter..." _
+                ;;
+            7) do_instance_firewall_menu ;;
+            0) return ;;
+            *) log_warn "Неверный выбор" ;;
+        esac
+    done
+}
+
+do_instance_firewall_menu() {
+    if ! select_instance_interactive; then
+        return
+    fi
+    local name="$SELECTED_INSTANCE"
+    local chain
+    chain=$(instance_chain_name "$name")
+
+    while true; do
+        echo ""
+        echo -e "${BOLD}  Файрвол инстанса '${name}' (цепочка ${chain})${NC}"
+        echo "  ─────────────────────────────────────────────"
+        if iptables -L "$chain" -n --line-numbers 2>/dev/null | grep -qE '^[0-9]+ +ACCEPT'; then
+            iptables -L "$chain" -n --line-numbers 2>/dev/null | grep -E '^[0-9]+ +ACCEPT' | sed 's/^/    /'
+        else
+            echo "    (цепочка не настроена или пуста)"
+        fi
+        echo ""
+        echo "  1) Добавить IP в пер-инстанс whitelist"
+        echo "  2) Удалить правило по номеру"
+        echo "  3) Удалить пер-инстанс цепочку полностью"
+        echo ""
+        echo "  0) ← Назад"
+        echo ""
+        read -rp "  Выберите: " ch
+        case $ch in
+            1)
+                read -rp "  IP/подсеть: " ip
+                if validate_ip "$ip"; then
+                    add_allowed_ip_for_instance "$name" "$ip"
+                    log_info "Добавлено в ${chain}: ${ip}"
+                else
+                    log_error "Некорректный IP"
+                fi
+                ;;
+            2)
+                read -rp "  Номер: " rn
+                if [[ "$rn" =~ ^[0-9]+$ ]]; then
+                    if iptables -D "$chain" "$rn" 2>/dev/null; then
+                        save_iptables
+                        log_info "Удалено правило #${rn}"
+                    else
+                        log_error "Не удалось"
+                    fi
+                fi
+                ;;
+            3)
+                cleanup_instance_chain "$name"
+                log_info "Цепочка ${chain} удалена"
                 ;;
             0) return ;;
             *) log_warn "Неверный выбор" ;;
@@ -2022,67 +2662,31 @@ do_access_menu() {
     done
 }
 
-validate_ip() {
-    local ip="$1"
-    [[ "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] && return 0
-    [[ "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+/[0-9]+$ ]] && return 0
-    return 1
-}
-
-add_allowed_ip() {
-    local ip="$1"
-    ensure_firewall_chain
-
-    if iptables -C "$IPTABLES_CHAIN" -s "$ip" -j ACCEPT 2>/dev/null; then
-        log_warn "IP $ip уже в списке"
-        return
-    fi
-
-    # Вставляем перед последним правилом (полиси-правилом).
-    local total
-    total=$(chain_rule_count)
-    if [[ $total -ge 1 ]]; then
-        iptables -I "$IPTABLES_CHAIN" "$total" -s "$ip" -j ACCEPT
-    else
-        iptables -A "$IPTABLES_CHAIN" -s "$ip" -j ACCEPT
-    fi
-
-    save_iptables
-}
-
-enable_whitelist_mode() {
-    ensure_firewall_chain
-
-    if [[ "$(current_policy_mode)" == "whitelist" ]]; then
-        log_warn "Режим белого списка уже включён"
-        return
-    fi
-
-    set_policy_mode whitelist
-}
-
 # ============================================================================
 #  БЭКАП / ВОССТАНОВЛЕНИЕ
 # ============================================================================
 
 do_backup_menu() {
+    if ! require_instance; then
+        return
+    fi
     while true; do
         echo ""
         echo -e "${BOLD}══════════════════════════════════════════════════${NC}"
-        echo -e "  Бэкап и восстановление"
+        echo -e "  Бэкап и восстановление (инстанс: ${CYAN}${INST_NAME}${NC})"
         echo -e "${BOLD}══════════════════════════════════════════════════${NC}"
         echo ""
 
         local backup_files=()
         if [[ -d "$BACKUP_DIR" ]]; then
             local f
-            for f in "$BACKUP_DIR"/*.tar.gz; do
+            for f in "$BACKUP_DIR"/${INST_NAME}_*.tar.gz; do
                 [[ -f "$f" ]] && backup_files+=("$f")
             done
         fi
 
         if [[ ${#backup_files[@]} -gt 0 ]]; then
-            echo "  Существующие бэкапы:"
+            echo "  Бэкапы инстанса:"
             echo "  ─────────────────────────────────────────────"
             local idx=0 size
             for f in "${backup_files[@]}"; do
@@ -2092,12 +2696,12 @@ do_backup_menu() {
             done
             echo ""
         else
-            echo "  Бэкапов пока нет"
+            echo "  Бэкапов инстанса ${INST_NAME} пока нет"
             echo ""
         fi
 
-        echo "  1) Создать бэкап хранилищ"
-        echo "  2) Восстановить из бэкапа"
+        echo "  1) Создать бэкап всех хранилищ инстанса"
+        echo "  2) Восстановить инстанс из бэкапа"
         echo "  3) Настроить автоматический бэкап (cron)"
         echo "  4) Удалить старые бэкапы (по возрасту)"
         echo "  5) Удалить бэкап по номеру"
@@ -2117,7 +2721,7 @@ do_backup_menu() {
                     log_error "Срок должен быть положительным числом"
                 else
                     if [[ -d "$BACKUP_DIR" ]]; then
-                        find "$BACKUP_DIR" -maxdepth 1 -name "crserver_backup_*.tar.gz" -mtime +"$days" -delete 2>/dev/null
+                        find "$BACKUP_DIR" -maxdepth 1 -name "${INST_NAME}_*.tar.gz" -mtime +"$days" -delete 2>/dev/null
                         log_info "Бэкапы старше ${days} дней удалены"
                     else
                         log_warn "Каталог бэкапов не существует"
@@ -2128,7 +2732,7 @@ do_backup_menu() {
                 if [[ ${#backup_files[@]} -eq 0 ]]; then
                     log_warn "Нет бэкапов для удаления"
                 else
-                    read -rp "  Номер бэкапа для удаления (или 0 для отмены): " num
+                    read -rp "  Номер бэкапа (или 0 для отмены): " num
                     if [[ "$num" == "0" || -z "$num" ]]; then
                         :
                     elif [[ "$num" =~ ^[0-9]+$ ]] && (( num >= 1 && num <= ${#backup_files[@]} )); then
@@ -2151,20 +2755,25 @@ do_backup_menu() {
     done
 }
 
+# Бэкап всего REPO_DIR текущего инстанса
 do_backup() {
-    if [[ ! -d "$REPO_DIR" ]]; then
-        log_error "Каталог хранилищ не существует: ${REPO_DIR}"
+    if [[ -z "${INST_NAME:-}" ]]; then
+        log_error "do_backup: контекст инстанса не задан"
+        return 1
+    fi
+    if [[ ! -d "$INST_REPO_DIR" ]]; then
+        log_error "Каталог хранилищ не существует: ${INST_REPO_DIR}"
         return 1
     fi
 
     mkdir -p "$BACKUP_DIR"
     local timestamp backup_file
     timestamp=$(date +%Y%m%d_%H%M%S)
-    backup_file="${BACKUP_DIR}/crserver_backup_${timestamp}.tar.gz"
+    backup_file="${BACKUP_DIR}/${INST_NAME}_${timestamp}.tar.gz"
 
-    log_step "Создание бэкапа хранилищ..."
+    log_step "Создание бэкапа инстанса ${INST_NAME}..."
     if ! tar -czf "$backup_file" \
-            -C "$(dirname "$REPO_DIR")" "$(basename "$REPO_DIR")" \
+            -C "$(dirname "$INST_REPO_DIR")" "$(basename "$INST_REPO_DIR")" \
             --ignore-failed-read 2>/tmp/crserver-tar.log; then
         log_error "Создание бэкапа не удалось:"
         tail -5 /tmp/crserver-tar.log | sed 's/^/    /'
@@ -2176,70 +2785,91 @@ do_backup() {
     local size
     size=$(du -sh "$backup_file" 2>/dev/null | awk '{print $1}')
     log_info "Бэкап создан: ${backup_file} [${size:-?}]"
+    return 0
 }
 
 do_restore() {
-    if [[ ! -d "$BACKUP_DIR" ]] || ! ls "$BACKUP_DIR"/*.tar.gz &>/dev/null; then
-        log_warn "Нет доступных бэкапов в ${BACKUP_DIR}"
+    if [[ -z "${INST_NAME:-}" ]]; then
+        log_error "do_restore: контекст инстанса не задан"
+        return 1
+    fi
+    if [[ ! -d "$BACKUP_DIR" ]]; then
+        log_warn "Нет каталога бэкапов: ${BACKUP_DIR}"
+        return
+    fi
+
+    local files=()
+    local f
+    for f in "$BACKUP_DIR"/${INST_NAME}_*.tar.gz; do
+        [[ -f "$f" ]] && files+=("$f")
+    done
+    if [[ ${#files[@]} -eq 0 ]]; then
+        log_warn "Нет бэкапов инстанса ${INST_NAME}"
         return
     fi
 
     echo ""
     echo "  Доступные бэкапы:"
-    local files=()
     local idx=0
-    for f in "$BACKUP_DIR"/*.tar.gz; do
+    for f in "${files[@]}"; do
         idx=$((idx + 1))
-        files+=("$f")
         echo "    ${idx}) $(basename "$f")"
     done
-
     echo ""
     read -rp "  Номер бэкапа: " num
-
-    if [[ "$num" =~ ^[0-9]+$ ]] && [[ $num -ge 1 ]] && [[ $num -le ${#files[@]} ]]; then
-        local selected="${files[$((num - 1))]}"
-        echo ""
-        log_warn "Это перезапишет текущие хранилища в ${REPO_DIR}!"
-        read -rp "  Продолжить? (y/N): " answer
-        if [[ "$answer" =~ ^[Yy]$ ]]; then
-            local was_active=0
-            if systemctl is-active --quiet ${SERVICE_NAME} 2>/dev/null; then
-                was_active=1
-            fi
-            systemctl stop ${SERVICE_NAME} 2>/dev/null || true
-
-            if ! tar -xzf "$selected" -C "$(dirname "$REPO_DIR")" 2>/tmp/crserver-tar.log; then
-                log_error "Ошибка распаковки бэкапа:"
-                tail -5 /tmp/crserver-tar.log | sed 's/^/    /'
-                rm -f /tmp/crserver-tar.log
-                # Пытаемся вернуть службу в исходное состояние
-                if [[ $was_active -eq 1 ]]; then
-                    systemctl start ${SERVICE_NAME} 2>/dev/null || true
-                fi
-                return 1
-            fi
-            rm -f /tmp/crserver-tar.log
-
-            detect_1c_user
-            if [[ -n "$SVC_USER" && -n "$SVC_GROUP" ]]; then
-                chown -R "${SVC_USER}:${SVC_GROUP}" "$REPO_DIR"
-            fi
-
-            if [[ $was_active -eq 1 ]]; then
-                if ! systemctl start ${SERVICE_NAME} 2>/dev/null; then
-                    log_error "Служба не запустилась после восстановления — journalctl -u ${SERVICE_NAME}"
-                fi
-            fi
-            log_info "Восстановлено из: $(basename "$selected")"
-        fi
-    else
-        log_error "Неверный номер"
+    if [[ "$num" == "0" || -z "$num" ]]; then
+        return
     fi
+    if ! [[ "$num" =~ ^[0-9]+$ ]] || (( num < 1 || num > ${#files[@]} )); then
+        log_error "Неверный номер"
+        return 1
+    fi
+
+    local selected="${files[$((num - 1))]}"
+    echo ""
+    log_warn "Это перезапишет ${INST_REPO_DIR}!"
+    read -rp "  Продолжить? (y/N): " answer
+    if [[ ! "$answer" =~ ^[Yy]$ ]]; then
+        return
+    fi
+
+    local unit="crserver@${INST_NAME}.service"
+    local was_active=0
+    if systemctl is-active --quiet "$unit" 2>/dev/null; then
+        was_active=1
+    fi
+    systemctl stop "$unit" 2>/dev/null || true
+
+    if ! tar -xzf "$selected" -C "$(dirname "$INST_REPO_DIR")" 2>/tmp/crserver-tar.log; then
+        log_error "Ошибка распаковки:"
+        tail -5 /tmp/crserver-tar.log | sed 's/^/    /'
+        rm -f /tmp/crserver-tar.log
+        if [[ $was_active -eq 1 ]]; then
+            systemctl start "$unit" 2>/dev/null || true
+        fi
+        return 1
+    fi
+    rm -f /tmp/crserver-tar.log
+
+    detect_1c_user
+    if [[ -n "${SVC_USER:-}" && -n "${SVC_GROUP:-}" ]]; then
+        chown -R "${SVC_USER}:${SVC_GROUP}" "$INST_REPO_DIR"
+    fi
+
+    if [[ $was_active -eq 1 ]]; then
+        if ! systemctl start "$unit" 2>/dev/null; then
+            log_error "Служба не запустилась — journalctl -u ${unit}"
+        fi
+    fi
+    log_info "Восстановлено: $(basename "$selected")"
 }
 
 do_setup_cron_backup() {
-    local cron_script="/usr/local/bin/crserver-backup.sh"
+    if [[ -z "${INST_NAME:-}" ]]; then
+        log_error "do_setup_cron_backup: контекст инстанса не задан"
+        return 1
+    fi
+    local cron_script="/usr/local/bin/crserver-backup-${INST_NAME}.sh"
     local keep_days=30
 
     read -rp "  Хранить N дней [30]: " input_days
@@ -2255,27 +2885,28 @@ do_setup_cron_backup() {
     cat > "$cron_script" << EOFCRON
 #!/bin/bash
 set -u
+INST="${INST_NAME}"
 BACKUP_DIR="${BACKUP_DIR}"
-REPO_DIR="${REPO_DIR}"
+REPO_DIR="${INST_REPO_DIR}"
 KEEP_DAYS=${keep_days}
 
 mkdir -p "\$BACKUP_DIR"
 timestamp=\$(date +%Y%m%d_%H%M%S)
-log_file="\${BACKUP_DIR}/.last-backup.log"
-if ! tar -czf "\${BACKUP_DIR}/crserver_backup_\${timestamp}.tar.gz" \\
+log_file="\${BACKUP_DIR}/.last-backup-\${INST}.log"
+if ! tar -czf "\${BACKUP_DIR}/\${INST}_\${timestamp}.tar.gz" \\
         -C "\$(dirname "\$REPO_DIR")" "\$(basename "\$REPO_DIR")" \\
         --ignore-failed-read 2>"\$log_file"; then
-    logger -t crserver-backup "FAILED at \${timestamp}, see \${log_file}"
+    logger -t crserver-backup "FAILED \${INST} at \${timestamp}, see \${log_file}"
     exit 1
 fi
-find "\$BACKUP_DIR" -maxdepth 1 -name "crserver_backup_*.tar.gz" -mtime +\${KEEP_DAYS} -delete 2>/dev/null
+find "\$BACKUP_DIR" -maxdepth 1 -name "\${INST}_*.tar.gz" -mtime +\${KEEP_DAYS} -delete 2>/dev/null
 EOFCRON
 
     chmod +x "$cron_script"
     local cron_line="0 3 * * * ${cron_script}"
     (crontab -l 2>/dev/null | grep -F -v "$cron_script"; echo "$cron_line") | crontab -
 
-    log_info "Автобэкап: ежедневно в 03:00, хранение ${keep_days} дней"
+    log_info "Автобэкап инстанса ${INST_NAME}: ежедневно в 03:00, хранение ${keep_days} дней"
 }
 
 # ============================================================================
@@ -2290,11 +2921,11 @@ do_tools_menu() {
         echo -e "${BOLD}══════════════════════════════════════════════════${NC}"
         echo ""
         echo "  1) Информация о системе"
-        echo "  2) Список хранилищ"
-        echo "  3) Проверка подключения к порту"
+        echo "  2) Список хранилищ всех инстансов"
+        echo "  3) Проверка подключения к порту инстанса"
         echo "  4) Дисковое пространство"
-        echo "  5) Проверка открытых портов"
-        echo "  6) Диагностика проблем"
+        echo "  5) Открытые порты 1С"
+        echo "  6) Диагностика инстанса"
         echo ""
         echo "  0) ← Назад"
         echo ""
@@ -2302,15 +2933,16 @@ do_tools_menu() {
 
         case $choice in
             1) echo ""; do_system_info; read -rp "  Нажмите Enter..." _ ;;
-            2) echo ""; do_list_repos; read -rp "  Нажмите Enter..." _ ;;
+            2) echo ""; do_list_all_repos; read -rp "  Нажмите Enter..." _ ;;
             3)
-                read -rp "  IP для проверки (Enter для localhost): " test_ip
+                if ! require_instance; then continue; fi
+                read -rp "  IP для проверки (Enter — localhost): " test_ip
                 test_ip="${test_ip:-127.0.0.1}"
                 echo ""
-                if timeout 3 bash -c "echo >/dev/tcp/${test_ip}/${REPO_PORT}" 2>/dev/null; then
-                    log_info "Порт ${REPO_PORT} на ${test_ip} доступен"
+                if timeout 3 bash -c "echo >/dev/tcp/${test_ip}/${INST_PORT}" 2>/dev/null; then
+                    log_info "Порт ${INST_PORT} на ${test_ip} доступен"
                 else
-                    log_error "Порт ${REPO_PORT} на ${test_ip} недоступен"
+                    log_error "Порт ${INST_PORT} на ${test_ip} недоступен"
                 fi
                 read -rp "  Нажмите Enter..." _
                 ;;
@@ -2319,8 +2951,13 @@ do_tools_menu() {
                 echo "  Дисковое пространство:"
                 echo "  ─────────────────────────────────────────────"
                 df -h / | tail -1 | awk '{printf "    Диск:      %s из %s (использовано %s)\n", $3, $2, $5}'
-                [[ -d "$REPO_DIR" ]]    && echo "    Хранилища: $(du -sh "$REPO_DIR" 2>/dev/null | awk '{print $1}')"
-                [[ -d "$BACKUP_DIR" ]]  && echo "    Бэкапы:    $(du -sh "$BACKUP_DIR" 2>/dev/null | awk '{print $1}')"
+                instance_list
+                local n p
+                for n in "${INSTANCES[@]+"${INSTANCES[@]}"}"; do
+                    p=$(awk -F'"' '/^REPO_DIR=/ {print $2; exit}' "${INSTANCES_DIR}/${n}.conf" 2>/dev/null || true)
+                    [[ -d "$p" ]] && echo "    ${n}: $(du -sh "$p" 2>/dev/null | awk '{print $1}')  ($p)"
+                done
+                [[ -d "$BACKUP_DIR" ]]   && echo "    Бэкапы:    $(du -sh "$BACKUP_DIR" 2>/dev/null | awk '{print $1}')"
                 [[ -d "$PACKAGES_DIR" ]] && echo "    Пакеты:    $(du -sh "$PACKAGES_DIR" 2>/dev/null | awk '{print $1}')"
                 echo ""
                 read -rp "  Нажмите Enter..." _
@@ -2334,7 +2971,11 @@ do_tools_menu() {
                 echo ""
                 read -rp "  Нажмите Enter..." _
                 ;;
-            6) echo ""; do_diagnose; read -rp "  Нажмите Enter..." _ ;;
+            6)
+                if require_instance; then
+                    echo ""; do_diagnose; read -rp "  Нажмите Enter..." _
+                fi
+                ;;
             0) return ;;
             *) log_warn "Неверный выбор" ;;
         esac
@@ -2342,10 +2983,10 @@ do_tools_menu() {
 }
 
 do_system_info() {
-    detect_active_version
     detect_1c_user
     get_installed_versions
     get_available_versions
+    instance_list
 
     local os_name
     os_name=$(lsb_release -ds 2>/dev/null || true)
@@ -2361,8 +3002,7 @@ do_system_info() {
     echo ""
     echo "  1С:Предприятие"
     echo "  ─────────────────────────────────────────────"
-    echo "    Активная:      ${ACTIVE_VERSION:-не установлена}"
-    echo -n "    Установленные: "
+    echo -n "    Установлено:   "
     if [[ ${#INSTALLED_VERSIONS[@]} -gt 0 ]]; then
         echo "${INSTALLED_VERSIONS[*]}"
     else
@@ -2375,77 +3015,83 @@ do_system_info() {
         echo "(нет)"
     fi
     echo "    Пользователь:  ${SVC_USER}:${SVC_GROUP:-?}"
-    echo "    Порт:          ${REPO_PORT}"
-    echo "    Каталог:       ${REPO_DIR}"
+    echo ""
+    echo "  Инстансы (${#INSTANCES[@]}):"
+    echo "  ─────────────────────────────────────────────"
+    local n status_text def
+    def=$(instance_default)
+    for n in "${INSTANCES[@]+"${INSTANCES[@]}"}"; do
+        status_text=$(instance_status "$n")
+        local mark=""
+        [[ "$n" == "$def" ]] && mark="  (default)"
+        echo "    ${n}  [${status_text}]${mark}"
+    done
     echo ""
 
     echo "  Пакеты dpkg:"
     echo "  ─────────────────────────────────────────────"
-    dpkg -l | grep 1c-enterprise | awk '{printf "    %-50s %s\n", $2, $3}' 2>/dev/null || echo "    (не установлены)"
+    dpkg -l 2>/dev/null | grep 1c-enterprise | awk '{printf "    %-50s %s\n", $2, $3}' || echo "    (не установлены)"
     echo ""
 }
 
-do_list_repos() {
-    echo "  Хранилища в ${REPO_DIR}:"
-    echo "  ─────────────────────────────────────────────"
-
-    if [[ ! -d "$REPO_DIR" ]]; then
-        echo "    (каталог не существует)"
+do_list_all_repos() {
+    instance_list
+    if [[ ${#INSTANCES[@]} -eq 0 ]]; then
+        echo "  (инстансов нет)"
         return
     fi
-
-    local found=0 ip_addr
+    local ip_addr
     ip_addr=$(get_primary_ip)
-    local dir name size
-    for dir in "$REPO_DIR"/*/; do
-        if [[ -d "$dir" ]]; then
-            found=1
-            name=$(basename "$dir")
-            size=$(du -sh "$dir" 2>/dev/null | awk '{print $1}')
-            echo "    ${name}  [${size:-?}]"
-            echo "      → tcp://${ip_addr}:${REPO_PORT}/${name}"
-            echo ""
+    local n
+    for n in "${INSTANCES[@]}"; do
+        instance_load "$n" || continue
+        echo ""
+        echo "  Инстанс ${n}  (port ${INST_PORT}, ${INST_REPO_DIR})"
+        echo "  ─────────────────────────────────────────────"
+        if [[ ! -d "$INST_REPO_DIR" ]]; then
+            echo "    (каталог не существует)"
+            continue
+        fi
+        local found=0 dir name size
+        for dir in "$INST_REPO_DIR"/*/; do
+            if [[ -d "$dir" ]]; then
+                found=1
+                name=$(basename "$dir")
+                size=$(du -sh "$dir" 2>/dev/null | awk '{print $1}')
+                echo "    ${name}  [${size:-?}]"
+                echo "      → tcp://${ip_addr}:${INST_PORT}/${name}"
+            fi
+        done
+        if [[ $found -eq 0 ]]; then
+            echo "    (пусто)"
         fi
     done
-
-    if [[ $found -eq 0 ]]; then
-        echo "    (пусто — создайте хранилище из конфигуратора 1С)"
-        echo ""
-        echo "    Адрес: tcp://${ip_addr}:${REPO_PORT}/<имя_хранилища>"
-    fi
     echo ""
 }
 
+# Диагностика конкретного инстанса. Контекст должен быть загружен (INST_*).
 do_diagnose() {
-    echo "  Диагностика"
+    if [[ -z "${INST_NAME:-}" ]]; then
+        log_error "do_diagnose: не задан контекст инстанса"
+        return 1
+    fi
+    local unit="crserver@${INST_NAME}.service"
+    local issues=0
+
+    echo "  Диагностика инстанса '${INST_NAME}'"
     echo "  ─────────────────────────────────────────────"
 
-    detect_active_version
     detect_1c_user
     get_installed_versions
 
-    local issues=0
-
-    # crserver
-    if [[ -n "$ACTIVE_CRSERVER_BIN" && -f "$ACTIVE_CRSERVER_BIN" ]]; then
-        log_info "crserver: $ACTIVE_CRSERVER_BIN"
+    local bin="/opt/1cv8/x86_64/${INST_VERSION}/crserver"
+    if [[ -f "$bin" ]]; then
+        log_info "crserver: ${bin}"
     else
-        log_error "crserver не найден"
+        log_error "crserver не найден: ${bin} (фантомная версия)"
         issues=$((issues + 1))
     fi
 
-    # Фантом активной версии — юнит ссылается на удалённый бинарник
-    if [[ "$ACTIVE_VERSION_PHANTOM" -eq 1 ]]; then
-        log_error "Активная версия (${ACTIVE_VERSION}) — ФАНТОМ: бинарник ${ACTIVE_CRSERVER_BIN} удалён"
-        if [[ ${#INSTALLED_VERSIONS[@]} -gt 0 ]]; then
-            echo "    → Запустите меню «Управление версиями» → Переключить — будет автофикс"
-        else
-            echo "    → Установите версию через «Управление версиями» → Установить"
-        fi
-        issues=$((issues + 1))
-    fi
-
-    # Установленные версии
     if [[ ${#INSTALLED_VERSIONS[@]} -gt 0 ]]; then
         log_info "Установлено версий: ${#INSTALLED_VERSIONS[@]} (${INSTALLED_VERSIONS[*]})"
     else
@@ -2453,45 +3099,41 @@ do_diagnose() {
         issues=$((issues + 1))
     fi
 
-    # Служба
-    if [[ -f /etc/systemd/system/${SERVICE_NAME}.service ]]; then
-        log_info "Файл службы существует"
+    if [[ -f "$SERVICE_TEMPLATE_FILE" ]]; then
+        log_info "Template ${SERVICE_TEMPLATE_FILE} существует"
     else
-        log_error "Файл службы не найден"
+        log_error "Нет template ${SERVICE_TEMPLATE_FILE}"
         issues=$((issues + 1))
     fi
 
-    if systemctl is-active --quiet ${SERVICE_NAME} 2>/dev/null; then
-        log_info "Служба работает"
+    if systemctl is-active --quiet "$unit" 2>/dev/null; then
+        log_info "Юнит ${unit}: работает"
     else
-        log_error "Служба не запущена"
+        log_error "Юнит ${unit}: не работает"
         issues=$((issues + 1))
     fi
 
-    # Порт
-    if ss -tlnp | grep -q ":${REPO_PORT}"; then
-        log_info "Порт ${REPO_PORT} слушается"
+    if ss -tlnp 2>/dev/null | grep -q ":${INST_PORT}"; then
+        log_info "Порт ${INST_PORT} слушается"
     else
-        log_error "Порт ${REPO_PORT} не слушается"
+        log_error "Порт ${INST_PORT} не слушается"
         issues=$((issues + 1))
     fi
 
-    # Права
-    if [[ -d "$REPO_DIR" ]]; then
+    if [[ -d "$INST_REPO_DIR" ]]; then
         local owner
-        owner=$(stat -c '%U:%G' "$REPO_DIR" 2>/dev/null || echo "?")
+        owner=$(stat -c '%U:%G' "$INST_REPO_DIR" 2>/dev/null || echo "?")
         if [[ "$owner" == "${SVC_USER}:${SVC_GROUP}" ]]; then
-            log_info "Права: ${owner}"
+            log_info "Права на хранилища: ${owner}"
         else
-            log_error "Права: ${owner} (ожидается ${SVC_USER}:${SVC_GROUP})"
+            log_error "Права на хранилища: ${owner} (ожидается ${SVC_USER}:${SVC_GROUP})"
             issues=$((issues + 1))
         fi
     else
-        log_error "Каталог ${REPO_DIR} не существует"
+        log_error "Каталог хранилищ ${INST_REPO_DIR} не существует"
         issues=$((issues + 1))
     fi
 
-    # Каталог пакетов
     if [[ -d "$PACKAGES_DIR" ]]; then
         get_available_versions
         log_info "Каталог пакетов: ${PACKAGES_DIR} (${#AVAILABLE_VERSIONS[@]} версий)"
@@ -2499,7 +3141,6 @@ do_diagnose() {
         log_warn "Каталог пакетов не создан: ${PACKAGES_DIR}"
     fi
 
-    # Локаль
     if locale -a 2>/dev/null | grep -q "ru_RU.utf8"; then
         log_info "Локаль ru_RU.UTF-8"
     else
@@ -2507,7 +3148,6 @@ do_diagnose() {
         issues=$((issues + 1))
     fi
 
-    # Диск
     local disk_usage
     disk_usage=$(df / 2>/dev/null | tail -1 | awk '{print $5}' | tr -d '%' || true)
     if [[ "$disk_usage" =~ ^[0-9]+$ ]]; then
@@ -2517,8 +3157,6 @@ do_diagnose() {
             log_warn "Диск: ${disk_usage}% — мало места!"
             issues=$((issues + 1))
         fi
-    else
-        log_warn "Не удалось определить занятость диска"
     fi
 
     echo ""
@@ -2531,7 +3169,7 @@ do_diagnose() {
 }
 
 # ============================================================================
-#  УСТАНОВКА / УДАЛЕНИЕ ИЗ СИСТЕМНОГО PATH
+#  УСТАНОВКА В PATH
 # ============================================================================
 
 SYMLINK_NAME="crserver"
@@ -2609,15 +3247,13 @@ do_path_uninstall() {
 #  ОБНОВЛЕНИЕ СКРИПТА (self-update)
 # ============================================================================
 
-# Извлекает значение SCRIPT_VERSION="..." из файла, не выполняя его
 extract_version() {
     local file="$1"
     [[ -f "$file" ]] || return 1
     awk -F'"' '/^SCRIPT_VERSION=/ {print $2; exit}' "$file"
 }
 
-# Сравнивает две semver-подобные строки. Возвращает:
-#   0 — равны, 1 — A > B, 2 — A < B
+# Возвращает: 0 — равны, 1 — A > B, 2 — A < B
 version_compare() {
     local a="$1" b="$2"
     [[ "$a" == "$b" ]] && return 0
@@ -2629,7 +3265,6 @@ version_compare() {
     local i ai bi
     for (( i = 0; i < len; i++ )); do
         ai="${ia[i]:-0}"; bi="${ib[i]:-0}"
-        # Числовая часть (для нечисленных хвостов вроде -beta берём только цифры в начале)
         ai="${ai%%[!0-9]*}"; bi="${bi%%[!0-9]*}"
         ai="${ai:-0}"; bi="${bi:-0}"
         if (( 10#$ai > 10#$bi )); then return 1; fi
@@ -2638,10 +3273,7 @@ version_compare() {
     return 0
 }
 
-# Скачивает удалённый скрипт во временный файл. echo'ит путь к файлу.
-# raw.githubusercontent.com отдаёт ответ через Fastly CDN с TTL 5 минут —
-# без обхода кэша свежепушеные версии до 5 минут видны как старые.
-# Защита: query-параметр с timestamp + заголовки no-cache/pragma.
+# Кэш-бастер на raw.githubusercontent.com (Fastly TTL 5 минут).
 download_remote_script() {
     if ! command -v curl >/dev/null 2>&1; then
         log_error "Для обновления нужен curl: apt-get install curl" >&2
@@ -2664,8 +3296,6 @@ download_remote_script() {
     echo "$tmp"
 }
 
-# Печатает «текущая версия / удалённая версия» и возвращает:
-#   0 — обновление доступно, 1 — уже актуально, 2 — ошибка
 do_self_update_check() {
     log_step "Проверка обновлений..."
     echo "  Источник: ${UPDATE_URL}"
@@ -2696,14 +3326,10 @@ do_self_update_check() {
     esac
 }
 
-# Выполняет обновление. Аргумент: "force" — пропускает запрос подтверждения
-# и работает даже если версии равны (полезно при ручном hotfix).
 do_self_update() {
     local force="${1:-}"
 
-    # Если скрипт запущен через симлинк (например, /usr/local/bin/crserver →
-    # /root/crserver-manager.sh) — обновляем РЕАЛЬНЫЙ файл, а не симлинк,
-    # иначе mv заменит симлинк обычным файлом и сломает раскладку.
+    # Через симлинк обновляем РЕАЛЬНЫЙ файл, а не симлинк.
     local invoked_path script_path
     invoked_path="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
     if [[ -L "$invoked_path" ]]; then
@@ -2731,7 +3357,6 @@ do_self_update() {
         return 1
     fi
 
-    # Проверка синтаксиса перед заменой
     if ! bash -n "$tmp" 2>/tmp/crserver-update-syntax.log; then
         log_error "Скачанный скрипт содержит синтаксические ошибки:"
         sed 's/^/    /' /tmp/crserver-update-syntax.log
@@ -2766,7 +3391,6 @@ do_self_update() {
         fi
     fi
 
-    # Бэкап текущего файла рядом с ним
     local backup_path="${script_path}.bak.$(date +%Y%m%d_%H%M%S)"
     if ! cp -p "$script_path" "$backup_path"; then
         log_error "Не удалось создать резервную копию"
@@ -2775,11 +3399,9 @@ do_self_update() {
     fi
     log_info "Резервная копия: ${backup_path}"
 
-    # Сохраняем биты прав (rwxr-xr-x как у Edit, но возьмём текущие)
     local mode
     mode=$(stat -c '%a' "$script_path" 2>/dev/null || echo "755")
 
-    # Атомарная замена через mv в пределах одного раздела
     if ! mv -f "$tmp" "$script_path"; then
         log_error "Не удалось заменить файл — восстанавливаю из бэкапа"
         cp -p "$backup_path" "$script_path" || true
@@ -2806,7 +3428,7 @@ do_update_menu() {
     echo ""
     echo "  1) Проверить наличие обновлений"
     echo "  2) Обновить (с подтверждением)"
-    echo "  3) Обновить принудительно (--force, перезаписать любую версию)"
+    echo "  3) Обновить принудительно (--force)"
     echo ""
     echo "  0) ← Назад"
     echo ""
@@ -2831,47 +3453,48 @@ do_help() {
     echo -e "  Справка — crserver-manager.sh v${SCRIPT_VERSION}"
     echo -e "${BOLD}══════════════════════════════════════════════════${NC}"
     echo ""
-    echo "  Использование:"
-    echo "    sudo ./crserver-manager.sh              интерактивное меню"
-    echo "    sudo ./crserver-manager.sh install      полная установка"
-    echo "    sudo ./crserver-manager.sh uninstall    полное удаление"
-    echo "    sudo ./crserver-manager.sh start        запуск службы"
-    echo "    sudo ./crserver-manager.sh stop         остановка"
-    echo "    sudo ./crserver-manager.sh restart      перезапуск"
-    echo "    sudo ./crserver-manager.sh status       статус"
-    echo "    sudo ./crserver-manager.sh logs         логи (последние 50)"
-    echo "    sudo ./crserver-manager.sh backup       создать бэкап"
-    echo "    sudo ./crserver-manager.sh diagnose     диагностика"
-    echo "    sudo ./crserver-manager.sh versions     список версий"
-    echo "    sudo ./crserver-manager.sh path-install добавить в PATH"
-    echo "    sudo ./crserver-manager.sh path-remove  удалить из PATH"
-    echo "    sudo ./crserver-manager.sh repo list           список хранилищ"
-    echo "    sudo ./crserver-manager.sh repo create <имя>   создать хранилище"
-    echo "    sudo ./crserver-manager.sh repo delete <имя>   удалить хранилище"
-    echo "    sudo ./crserver-manager.sh repo backup <имя>   бэкап хранилища"
-    echo "    sudo ./crserver-manager.sh update       обновить скрипт"
-    echo "      └─ update --check    проверить наличие обновлений"
-    echo "      └─ update --force    обновить принудительно"
-    echo "    sudo ./crserver-manager.sh version      версия скрипта"
-    echo "    sudo ./crserver-manager.sh help         эта справка"
+    echo "  Использование (общие команды работают с инстансом по умолчанию):"
+    echo "    sudo ./crserver-manager.sh                         интерактивное меню"
+    echo "    sudo ./crserver-manager.sh install                 первичная установка"
+    echo "    sudo ./crserver-manager.sh uninstall               полное удаление"
+    echo "    sudo ./crserver-manager.sh start|stop|restart      управление службой"
+    echo "    sudo ./crserver-manager.sh status                  статус"
+    echo "    sudo ./crserver-manager.sh logs                    логи (последние 50)"
+    echo "    sudo ./crserver-manager.sh backup                  создать бэкап"
+    echo "    sudo ./crserver-manager.sh diagnose                диагностика"
+    echo "    sudo ./crserver-manager.sh versions                список платформ"
+    echo "    sudo ./crserver-manager.sh path-install/path-remove"
     echo ""
-    echo "  Структура каталога пакетов:"
-    echo "    ${PACKAGES_DIR}/"
-    echo "    ├── 8.3.25.1560/"
-    echo "    │   ├── 1c-enterprise-*-common_*.deb"
-    echo "    │   ├── 1c-enterprise-*-server_*.deb"
-    echo "    │   ├── 1c-enterprise-*-ws_*.deb"
-    echo "    │   └── 1c-enterprise-*-crs_*.deb"
-    echo "    ├── 8.3.26.XXXX/"
-    echo "    │   └── ..."
+    echo "  Выбор инстанса:"
+    echo "    sudo ./crserver-manager.sh -i <имя> <команда>      на конкретном инстансе"
+    echo ""
+    echo "  Управление инстансами:"
+    echo "    sudo ./crserver-manager.sh instance list"
+    echo "    sudo ./crserver-manager.sh instance create <имя> [--version V] [--port P]"
+    echo "                                                  [--repo-dir D] [--log-dir L]"
+    echo "    sudo ./crserver-manager.sh instance delete <имя> [--purge-data]"
+    echo "    sudo ./crserver-manager.sh instance set-default <имя>"
+    echo "    sudo ./crserver-manager.sh instance start|stop|restart|status|logs <имя>"
+    echo ""
+    echo "  Хранилища (берут REPO_DIR из текущего/выбранного инстанса):"
+    echo "    sudo ./crserver-manager.sh repo list"
+    echo "    sudo ./crserver-manager.sh repo create <имя>"
+    echo "    sudo ./crserver-manager.sh repo delete <имя>"
+    echo "    sudo ./crserver-manager.sh repo backup <имя>"
+    echo ""
+    echo "  Обновление:"
+    echo "    sudo ./crserver-manager.sh update [--check|--force]"
+    echo ""
+    echo "  Структура каталогов:"
+    echo "    ${INSTANCES_DIR}/<имя>.conf"
+    echo "    ${SERVICE_TEMPLATE_FILE}"
+    echo "    /var/1c/repo-<имя>/   /var/log/1c/<имя>/"
+    echo "    ${BACKUP_DIR}/<имя>_<ts>.tar.gz"
+    echo "    ${PACKAGES_DIR}/<версия>/*.deb"
     echo ""
     echo "  Подключение из конфигуратора 1С:"
-    echo "    Конфигурация → Хранилище конфигурации →"
-    echo "      Создать/Подключиться к хранилищу"
     echo "    Адрес: tcp://IP_СЕРВЕРА:ПОРТ/имя_хранилища"
     echo ""
-    # Пауза только в интерактивном режиме (из меню), чтобы не задерживать
-    # CLI-вызов `crserver help` в скриптах/пайпах.
     if [[ -t 0 && "${HELP_INTERACTIVE:-0}" -eq 1 ]]; then
         read -rp "  Нажмите Enter..." _
     fi
@@ -2883,48 +3506,59 @@ do_help() {
 
 main_menu() {
     while true; do
-        load_config
-        detect_active_version
+        instance_list
         get_installed_versions
-        # Авто-предложение фикса фантомной активной версии
-        check_and_offer_phantom_fix
-
-        local status_text status_color
-        if [[ ${#INSTALLED_VERSIONS[@]} -eq 0 ]]; then
-            status_text="НЕ УСТАНОВЛЕН"
-            status_color="${RED}"
-        elif systemctl is-active --quiet ${SERVICE_NAME} 2>/dev/null; then
-            status_text="РАБОТАЕТ"
-            status_color="${GREEN}"
-        else
-            status_text="ОСТАНОВЛЕН"
-            status_color="${YELLOW}"
-        fi
+        local def
+        def=$(instance_default)
 
         clear 2>/dev/null || true
         echo ""
         echo -e "${BOLD}══════════════════════════════════════════════════${NC}"
         echo -e "${BOLD}  Сервер хранилища 1С:Предприятие${NC}   ${CYAN}v${SCRIPT_VERSION}${NC}"
-        local active_label="${ACTIVE_VERSION:-—}"
-        if [[ "$ACTIVE_VERSION_PHANTOM" -eq 1 ]]; then
-            active_label="${ACTIVE_VERSION} ${RED}(фантом — бинарник отсутствует)${NC}"
-        fi
-        echo -e "  Версия 1С: ${active_label}   Статус: ${status_color}${status_text}${NC}"
-        if [[ ${#INSTALLED_VERSIONS[@]} -gt 1 ]]; then
-            echo -e "  Установлено: ${INSTALLED_VERSIONS[*]}"
+
+        if [[ ${#INSTANCES[@]} -eq 0 ]]; then
+            if [[ -f "$LEGACY_SERVICE_FILE" ]]; then
+                echo -e "  ${YELLOW}Обнаружена старая установка v1.x — миграция в меню «Инстансы»${NC}"
+            else
+                echo -e "  ${YELLOW}Инстансы не настроены — выполните установку (1 → 'install')${NC}"
+            fi
+        else
+            echo -n "  Инстансы: "
+            local n status_text status_color first=1
+            for n in "${INSTANCES[@]}"; do
+                [[ $first -eq 0 ]] && echo -n "  "
+                status_text=$(instance_status "$n")
+                case "$status_text" in
+                    running) status_color="${GREEN}" ;;
+                    failed|phantom) status_color="${RED}" ;;
+                    *)       status_color="${YELLOW}" ;;
+                esac
+                local mark=""
+                [[ "$n" == "$def" ]] && mark="*"
+                echo -ne "${n}${mark} [${status_color}${status_text}${NC}]"
+                first=0
+            done
+            echo ""
+            if [[ ${#INSTALLED_VERSIONS[@]} -gt 0 ]]; then
+                echo "  Платформы: ${INSTALLED_VERSIONS[*]}"
+            fi
         fi
         echo -e "${BOLD}══════════════════════════════════════════════════${NC}"
         echo ""
-        echo "  1) Управление версиями"
-        echo "  2) Управление службой"
-        echo "  3) Настройки сервера"
+        echo "  1) Управление версиями (1С платформы)"
+        echo "  2) Инстансы"
+        echo "  3) Управление службами"
         echo "  4) Хранилища конфигураций"
-        echo "  5) Управление доступом (файрвол)"
-        echo "  6) Бэкап и восстановление (всё целиком)"
+        echo "  5) Файрвол"
+        echo "  6) Бэкап и восстановление"
         echo "  7) Инструменты"
         echo "  8) Быстрый вызов (PATH)"
         echo "  9) Обновление скрипта"
         echo " 10) Справка"
+        if [[ ${#INSTANCES[@]} -eq 0 ]]; then
+            echo ""
+            echo " 99) Полная установка (первый раз)"
+        fi
         echo ""
         echo "  0) Выход"
         echo ""
@@ -2932,8 +3566,8 @@ main_menu() {
 
         case $choice in
             1)  do_version_menu ;;
-            2)  do_service_menu ;;
-            3)  do_settings_menu ;;
+            2)  do_instance_menu ;;
+            3)  do_service_menu ;;
             4)  do_repo_menu ;;
             5)  do_access_menu ;;
             6)  do_backup_menu ;;
@@ -2941,6 +3575,7 @@ main_menu() {
             8)  do_path_menu ;;
             9)  do_update_menu ;;
             10) HELP_INTERACTIVE=1 do_help ;;
+            99) do_full_install ;;
             0)  echo ""; exit 0 ;;
             *)  log_warn "Неверный выбор" ;;
         esac
@@ -2948,56 +3583,319 @@ main_menu() {
 }
 
 # ============================================================================
-#  ТОЧКА ВХОДА: CLI-аргументы или интерактивное меню
+#  CLI: парсинг -i и команд
+# ============================================================================
+
+# instance подкоманды
+cli_instance() {
+    local sub="${1:-}"
+    shift || true
+    case "$sub" in
+        ""|list)
+            instance_list
+            if [[ ${#INSTANCES[@]} -eq 0 ]]; then
+                echo "(инстансов нет)"
+                return 0
+            fi
+            local def n status_text mark ver port
+            def=$(instance_default)
+            printf "%-20s %-10s %-12s %-6s  %s\n" "NAME" "STATUS" "VERSION" "PORT" "REPO_DIR"
+            for n in "${INSTANCES[@]}"; do
+                status_text=$(instance_status "$n")
+                ver=$(awk -F'"' '/^VERSION=/   {print $2; exit}' "${INSTANCES_DIR}/${n}.conf" 2>/dev/null || true)
+                port=$(awk -F'"' '/^REPO_PORT=/ {print $2; exit}' "${INSTANCES_DIR}/${n}.conf" 2>/dev/null || true)
+                mark=""
+                [[ "$n" == "$def" ]] && mark=" (default)"
+                printf "%-20s %-10s %-12s %-6s  %s%s\n" "$n" "$status_text" "${ver:-?}" "${port:-?}" \
+                    "$(awk -F'"' '/^REPO_DIR=/ {print $2; exit}' "${INSTANCES_DIR}/${n}.conf" 2>/dev/null || true)" "$mark"
+            done
+            ;;
+        create)
+            local name="${1:-}"
+            shift || true
+            if [[ -z "$name" ]]; then
+                log_error "Использование: $0 instance create <имя> [--version V --port P --repo-dir D --log-dir L]"
+                return 1
+            fi
+            if ! instance_name_valid "$name"; then
+                log_error "Недопустимое имя"
+                return 1
+            fi
+            if instance_exists "$name"; then
+                log_error "Инстанс уже существует: ${name}"
+                return 1
+            fi
+            local ver="" port="" repo="" logd=""
+            while [[ $# -gt 0 ]]; do
+                case "$1" in
+                    --version)  ver="${2:-}";  shift 2 ;;
+                    --port)     port="${2:-}"; shift 2 ;;
+                    --repo-dir) repo="${2:-}"; shift 2 ;;
+                    --log-dir)  logd="${2:-}"; shift 2 ;;
+                    *) log_error "Неизвестный аргумент: $1"; return 1 ;;
+                esac
+            done
+            if [[ -z "$ver" ]]; then
+                get_installed_versions
+                if [[ ${#INSTALLED_VERSIONS[@]} -ne 1 ]]; then
+                    log_error "--version обязателен (установлено версий: ${#INSTALLED_VERSIONS[@]})"
+                    return 1
+                fi
+                ver="${INSTALLED_VERSIONS[0]}"
+            fi
+            port="${port:-$DEFAULT_REPO_PORT}"
+            repo="${repo:-${REPO_BASE}/repo-${name}}"
+            logd="${logd:-${LOG_BASE}/${name}}"
+            INST_VERSION="$ver"
+            INST_PORT="$port"
+            INST_REPO_DIR="$repo"
+            INST_LOG_DIR="$logd"
+            if ! instance_save "$name"; then
+                return 1
+            fi
+            detect_1c_user
+            mkdir -p "$repo" "$logd" "$BACKUP_DIR"
+            if [[ -n "${SVC_USER:-}" && -n "${SVC_GROUP:-}" ]]; then
+                chown -R "${SVC_USER}:${SVC_GROUP}" "$repo" "$logd" 2>/dev/null || true
+            fi
+            generate_systemd_template
+            systemctl daemon-reload
+            systemctl enable "crserver@${name}.service" >/dev/null 2>&1 || true
+            add_input_for_port "$port"
+            instance_list
+            if [[ ${#INSTANCES[@]} -eq 1 ]]; then
+                instance_set_default "$name"
+            fi
+            log_info "Инстанс ${name} создан"
+            ;;
+        delete)
+            local name="${1:-}"
+            shift || true
+            local purge=0
+            if [[ "${1:-}" == "--purge-data" ]]; then
+                purge=1
+                shift || true
+            fi
+            if [[ -z "$name" ]]; then
+                log_error "Использование: $0 instance delete <имя> [--purge-data]"
+                return 1
+            fi
+            if ! instance_exists "$name"; then
+                log_error "Инстанс не найден: ${name}"
+                return 1
+            fi
+            instance_load "$name" || return 1
+            systemctl stop "crserver@${name}.service" 2>/dev/null || true
+            systemctl disable "crserver@${name}.service" 2>/dev/null || true
+            rm -f "${INSTANCES_DIR}/${name}.conf"
+            cleanup_instance_chain "$name"
+            remove_input_for_port "$INST_PORT"
+            if [[ $purge -eq 1 && -d "$INST_REPO_DIR" ]]; then
+                rm -rf "$INST_REPO_DIR" || log_warn "rm -rf не удался"
+            fi
+            if [[ -f "$DEFAULT_INSTANCE_FILE" ]]; then
+                local cur
+                cur=$(head -1 "$DEFAULT_INSTANCE_FILE" 2>/dev/null | tr -d '[:space:]' || true)
+                [[ "$cur" == "$name" ]] && rm -f "$DEFAULT_INSTANCE_FILE"
+            fi
+            systemctl daemon-reload
+            log_info "Инстанс ${name} удалён"
+            ;;
+        set-default)
+            local name="${1:-}"
+            if [[ -z "$name" ]]; then
+                log_error "Использование: $0 instance set-default <имя>"
+                return 1
+            fi
+            if instance_set_default "$name"; then
+                log_info "По умолчанию: ${name}"
+            else
+                return 1
+            fi
+            ;;
+        start|stop|restart|status|logs)
+            local action="$sub"
+            local name="${1:-}"
+            if [[ -z "$name" ]]; then
+                log_error "Использование: $0 instance ${action} <имя>"
+                return 1
+            fi
+            if ! instance_exists "$name"; then
+                log_error "Инстанс не найден: ${name}"
+                return 1
+            fi
+            local unit="crserver@${name}.service"
+            case "$action" in
+                start)   systemctl start "$unit"   && log_info "Запущен"   || { log_error "Ошибка"; return 1; } ;;
+                stop)    systemctl stop "$unit"    && log_info "Остановлен" || { log_error "Ошибка"; return 1; } ;;
+                restart) systemctl restart "$unit" && log_info "Перезапущен" || { log_error "Ошибка"; return 1; } ;;
+                status)  systemctl status "$unit" --no-pager || true ;;
+                logs)    journalctl -u "$unit" -n 50 --no-pager ;;
+            esac
+            ;;
+        *)
+            log_error "Использование: $0 instance {list|create|delete|set-default|start|stop|restart|status|logs}"
+            return 1
+            ;;
+    esac
+}
+
+# Команды, оперирующие на ВЫБРАННОМ инстансе (CLI_INSTANCE или дефолт)
+cli_run_on_instance() {
+    local cmd="$1"; shift || true
+    cli_select_instance || return 1
+    instance_load "$SELECTED_INSTANCE" || return 1
+    local unit="crserver@${INST_NAME}.service"
+    case "$cmd" in
+        start)
+            systemctl start "$unit" && log_info "Запущен (${INST_NAME})" || { log_error "Ошибка запуска"; return 1; }
+            ;;
+        stop)
+            systemctl stop "$unit" && log_info "Остановлен (${INST_NAME})" || { log_error "Ошибка остановки"; return 1; }
+            ;;
+        restart)
+            systemctl restart "$unit" && log_info "Перезапущен (${INST_NAME})" || { log_error "Ошибка"; return 1; }
+            ;;
+        status)
+            systemctl status "$unit" --no-pager || true
+            ss -tlnp 2>/dev/null | grep ":${INST_PORT}" || true
+            ;;
+        logs)
+            journalctl -u "$unit" -n 50 --no-pager
+            ;;
+        backup)
+            do_backup
+            ;;
+        diagnose)
+            do_diagnose
+            ;;
+        repo)
+            local subcmd="${1:-list}"
+            shift || true
+            case "$subcmd" in
+                list)
+                    local repos=()
+                    get_repo_list repos
+                    if [[ ${#repos[@]} -eq 0 ]]; then
+                        echo "(хранилищ нет)"
+                    else
+                        printf '%s\n' "${repos[@]}"
+                    fi
+                    ;;
+                create)
+                    if [[ -z "${1:-}" ]]; then
+                        log_error "Использование: $0 [-i name] repo create <имя>"
+                        return 1
+                    fi
+                    if ! validate_repo_name "$1"; then
+                        log_error "Недопустимое имя"
+                        return 1
+                    fi
+                    detect_1c_user
+                    if [[ -z "${SVC_USER:-}" || -z "${SVC_GROUP:-}" ]]; then
+                        log_error "Не определён пользователь usr1cv8"
+                        return 1
+                    fi
+                    local d="${INST_REPO_DIR}/$1"
+                    if [[ -e "$d" ]]; then
+                        log_error "Уже существует: $d"
+                        return 1
+                    fi
+                    mkdir -p "$d"
+                    chown "${SVC_USER}:${SVC_GROUP}" "$d"
+                    chmod 750 "$d"
+                    log_info "Создано: $d"
+                    ;;
+                delete)
+                    if [[ -z "${1:-}" ]]; then
+                        log_error "Использование: $0 [-i name] repo delete <имя>"
+                        return 1
+                    fi
+                    local d="${INST_REPO_DIR}/$1"
+                    if [[ ! -d "$d" ]]; then
+                        log_error "Не найдено: $d"
+                        return 1
+                    fi
+                    local was_active=0
+                    if systemctl is-active --quiet "$unit" 2>/dev/null; then
+                        was_active=1
+                        systemctl stop "$unit" 2>/dev/null || true
+                        sleep 1
+                    fi
+                    rm -rf "$d" && log_info "Удалено: $1"
+                    if [[ $was_active -eq 1 ]]; then
+                        systemctl start "$unit" 2>/dev/null || true
+                    fi
+                    ;;
+                backup)
+                    if [[ -z "${1:-}" ]]; then
+                        log_error "Использование: $0 [-i name] repo backup <имя>"
+                        return 1
+                    fi
+                    local d="${INST_REPO_DIR}/$1"
+                    if [[ ! -d "$d" ]]; then
+                        log_error "Не найдено: $d"
+                        return 1
+                    fi
+                    mkdir -p "$BACKUP_DIR"
+                    local ts a
+                    ts=$(date +%Y%m%d_%H%M%S)
+                    a="${BACKUP_DIR}/${INST_NAME}_repo_${1}_${ts}.tar.gz"
+                    if tar -czf "$a" -C "$INST_REPO_DIR" "$1" 2>/dev/null; then
+                        log_info "Бэкап: $a"
+                    else
+                        log_error "tar не удался"
+                        return 1
+                    fi
+                    ;;
+                *)
+                    log_error "Использование: $0 [-i name] repo {list|create <имя>|delete <имя>|backup <имя>}"
+                    return 1
+                    ;;
+            esac
+            ;;
+        *)
+            log_error "Неизвестная команда: $cmd"
+            return 1
+            ;;
+    esac
+}
+
+# ============================================================================
+#  ТОЧКА ВХОДА
 # ============================================================================
 
 check_root
-load_config
+
+# Парсим необязательный -i <name>
+CLI_INSTANCE=""
+if [[ "${1:-}" == "-i" || "${1:-}" == "--instance" ]]; then
+    if [[ -z "${2:-}" ]]; then
+        log_error "Опция -i требует имя инстанса"
+        exit 1
+    fi
+    CLI_INSTANCE="$2"
+    shift 2
+fi
 
 case "${1:-}" in
     install)       do_full_install ;;
     uninstall)     do_full_uninstall ;;
-    start)
-        if systemctl start ${SERVICE_NAME}; then
-            log_info "Запущен"
-        else
-            log_error "Ошибка запуска (journalctl -u ${SERVICE_NAME} -n 20)"
-            exit 1
-        fi
+    start|stop|restart|status|logs|backup|diagnose)
+        cli_run_on_instance "$1"
         ;;
-    stop)
-        if systemctl stop ${SERVICE_NAME}; then
-            log_info "Остановлен"
-        else
-            log_error "Ошибка остановки"
-            exit 1
-        fi
+    repo|repos)
+        shift
+        cli_run_on_instance repo "$@"
         ;;
-    restart)
-        if systemctl restart ${SERVICE_NAME}; then
-            log_info "Перезапущен"
-        else
-            log_error "Ошибка перезапуска (journalctl -u ${SERVICE_NAME} -n 20)"
-            exit 1
-        fi
+    instance|instances)
+        shift
+        cli_instance "$@"
         ;;
-    status)
-        if [[ ! -f /etc/systemd/system/${SERVICE_NAME}.service ]]; then
-            log_warn "Служба не установлена"
-            exit 1
-        fi
-        systemctl status ${SERVICE_NAME} --no-pager || true
-        ss -tlnp 2>/dev/null | grep ":${REPO_PORT}" || true
-        ;;
-    logs)          journalctl -u ${SERVICE_NAME} -n 50 --no-pager ;;
-    backup)        do_backup ;;
-    diagnose)      do_diagnose ;;
     versions)
-        detect_active_version
         get_installed_versions
         get_available_versions
         echo ""
-        echo "  Активная:      ${ACTIVE_VERSION:-—}"
         echo -n "  Установленные: "
         [[ ${#INSTALLED_VERSIONS[@]} -gt 0 ]] && echo "${INSTALLED_VERSIONS[*]}" || echo "(нет)"
         echo -n "  Пакеты:        "
@@ -3006,89 +3904,6 @@ case "${1:-}" in
         ;;
     path-install)  do_path_install ;;
     path-remove)   do_path_uninstall ;;
-    repo|repos)
-        case "${2:-list}" in
-            list)
-                local repos=()
-                get_repo_list repos
-                if [[ ${#repos[@]} -eq 0 ]]; then
-                    echo "(хранилищ нет)"
-                else
-                    printf '%s\n' "${repos[@]}"
-                fi
-                ;;
-            create)
-                if [[ -z "${3:-}" ]]; then
-                    log_error "Использование: $0 repo create <имя>"
-                    exit 1
-                fi
-                if ! validate_repo_name "$3"; then
-                    log_error "Недопустимое имя"
-                    exit 1
-                fi
-                detect_1c_user
-                if [[ -z "$SVC_USER" || -z "$SVC_GROUP" ]]; then
-                    log_error "Не определён пользователь usr1cv8"
-                    exit 1
-                fi
-                local d="${REPO_DIR}/$3"
-                if [[ -e "$d" ]]; then
-                    log_error "Уже существует: $d"
-                    exit 1
-                fi
-                mkdir -p "$d"
-                chown "${SVC_USER}:${SVC_GROUP}" "$d"
-                chmod 750 "$d"
-                log_info "Создано: $d"
-                ;;
-            delete)
-                if [[ -z "${3:-}" ]]; then
-                    log_error "Использование: $0 repo delete <имя>"
-                    exit 1
-                fi
-                local d="${REPO_DIR}/$3"
-                if [[ ! -d "$d" ]]; then
-                    log_error "Не найдено: $d"
-                    exit 1
-                fi
-                local was_active=0
-                if systemctl is-active --quiet ${SERVICE_NAME} 2>/dev/null; then
-                    was_active=1
-                    systemctl stop ${SERVICE_NAME} 2>/dev/null || true
-                    sleep 1
-                fi
-                rm -rf "$d" && log_info "Удалено: $3"
-                if [[ $was_active -eq 1 ]]; then
-                    systemctl start ${SERVICE_NAME} 2>/dev/null || true
-                fi
-                ;;
-            backup)
-                if [[ -z "${3:-}" ]]; then
-                    log_error "Использование: $0 repo backup <имя>"
-                    exit 1
-                fi
-                local d="${REPO_DIR}/$3"
-                if [[ ! -d "$d" ]]; then
-                    log_error "Не найдено: $d"
-                    exit 1
-                fi
-                mkdir -p "$BACKUP_DIR"
-                local ts a
-                ts=$(date +%Y%m%d_%H%M%S)
-                a="${BACKUP_DIR}/repo_${3}_${ts}.tar.gz"
-                if tar -czf "$a" -C "$REPO_DIR" "$3" 2>/dev/null; then
-                    log_info "Бэкап: $a"
-                else
-                    log_error "tar не удался"
-                    exit 1
-                fi
-                ;;
-            *)
-                log_error "Использование: $0 repo {list|create <имя>|delete <имя>|backup <имя>}"
-                exit 1
-                ;;
-        esac
-        ;;
     update)
         case "${2:-}" in
             ""|--yes|-y) do_self_update ;;
