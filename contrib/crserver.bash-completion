@@ -121,7 +121,7 @@ _crserver() {
             esac
             ;;
         repo|repos)
-            local repo_subs="list info create delete rename backup restore"
+            local repo_subs="list info create delete rename backup restore adopt"
             if [[ -z "$subcmd" ]]; then
                 COMPREPLY=( $(compgen -W "$repo_subs" -- "$cur") )
                 return 0
@@ -142,6 +142,17 @@ _crserver() {
                         COMPREPLY=( $(compgen -f -- "$cur") )
                         return 0
                     fi
+                    ;;
+                adopt)
+                    case "$prev" in
+                        --as) return 0 ;;  # имя — произвольное
+                    esac
+                    if [[ -z "$sub2" ]]; then
+                        COMPREPLY=( $(compgen -d -- "$cur") )
+                        return 0
+                    fi
+                    COMPREPLY=( $(compgen -W "--as --move --copy --force" -- "$cur") )
+                    return 0
                     ;;
             esac
             ;;

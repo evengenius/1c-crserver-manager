@@ -33,7 +33,7 @@ set -euo pipefail
 # --- Версия скрипта ---
 # При выпуске новой версии увеличить и закоммитить в репозиторий.
 # Используется для проверки обновлений (см. do_self_update).
-SCRIPT_VERSION="2.2.3"
+SCRIPT_VERSION="2.3.0"
 
 # --- Источник обновлений ---
 UPDATE_REPO="evengenius/1c-crserver-manager"
@@ -2083,6 +2083,7 @@ do_repo_menu() {
         echo "  6) Бэкап хранилища (одного)"
         echo "  7) Восстановить хранилище из бэкапа"
         echo "  8) Проверить целостность"
+        echo "  9) Инициализировать хранилище из существующего каталога"
         echo ""
         echo "  0) ← Назад"
         echo ""
@@ -2097,6 +2098,7 @@ do_repo_menu() {
             6) do_repo_backup;        read -rp "  Нажмите Enter..." _ ;;
             7) do_repo_restore;       read -rp "  Нажмите Enter..." _ ;;
             8) do_repo_check;         read -rp "  Нажмите Enter..." _ ;;
+            9) do_repo_adopt;         read -rp "  Нажмите Enter..." _ ;;
             0) return ;;
             *) log_warn "Неверный выбор" ;;
         esac
@@ -2164,6 +2166,239 @@ do_repo_create() {
     local ip_addr
     ip_addr=$(get_primary_ip)
     echo "    Адрес: tcp://${ip_addr}:${INST_PORT}/${name}"
+}
+
+# Подключает существующий каталог как хранилище инстанса.
+# Два режима выбора источника:
+#   1) Каталог УЖЕ внутри INST_REPO_DIR (но скрыт фильтром: rollback,
+#      невалидное имя, остаток от прерванного restore-staging) —
+#      «легализуем»: при необходимости переименовываем, выставляем
+#      права/владельца — и он становится виден в списке.
+#   2) Произвольный путь на диске (например, перенесённое хранилище)
+#      — копируем или перемещаем в INST_REPO_DIR/<имя>.
+do_repo_adopt() {
+    detect_1c_user
+    if [[ -z "${SVC_USER:-}" || -z "${SVC_GROUP:-}" ]]; then
+        log_error "Не определён пользователь usr1cv8 — выполните установку"
+        return 1
+    fi
+
+    # 1. Собираем "осиротевшие" каталоги внутри INST_REPO_DIR — те, что
+    #    есть на диске, но не показываются как хранилища (отфильтрованы
+    #    в get_repo_list).
+    local orphans=()
+    if [[ -d "$INST_REPO_DIR" ]]; then
+        local _d _n
+        for _d in "$INST_REPO_DIR"/*/; do
+            [[ -d "$_d" ]] || continue
+            _n=$(basename "$_d")
+            # Скрытые служебные .restore-staging.* пропускаем — они
+            # активные временные, нечего «усыновлять»
+            [[ "$_n" == .restore-staging.* ]] && continue
+            # Уже зарегистрированный валидный? — не предлагаем
+            if validate_repo_name "$_n" && [[ "$_n" != *.pre-restore.* ]]; then
+                continue
+            fi
+            orphans+=("$_n")
+        done
+    fi
+
+    echo ""
+    echo "  Источник каталога:"
+    if [[ ${#orphans[@]} -gt 0 ]]; then
+        echo "  Найдены каталоги в ${INST_REPO_DIR}, которые не зарегистрированы"
+        echo "  как хранилища (rollback, невалидные имена, после прерванного restore):"
+        echo ""
+        local _i=1 _o
+        for _o in "${orphans[@]}"; do
+            local _sz _init
+            _sz=$(du -sh "${INST_REPO_DIR}/${_o}" 2>/dev/null | awk '{print $1}')
+            if repo_looks_initialized "${INST_REPO_DIR}/${_o}"; then
+                _init="${GREEN}init${NC}"
+            else
+                _init="${YELLOW}пусто${NC}"
+            fi
+            echo -e "    ${_i}) ${_o}  [${_sz:-?}]  (${_init})"
+            _i=$((_i + 1))
+        done
+        echo ""
+        echo "    p) Произвольный путь на диске (вне ${INST_REPO_DIR})"
+        echo "    0) Отмена"
+    else
+        echo "  Не найдено осиротевших каталогов в ${INST_REPO_DIR}."
+        echo ""
+        echo "    p) Произвольный путь на диске"
+        echo "    0) Отмена"
+    fi
+    echo ""
+    read -rp "  Выберите: " src_choice
+
+    local source_path=""
+    local move_mode=0   # 1 — переместить, 0 — скопировать (для произвольного пути)
+    case "$src_choice" in
+        0|"") log_warn "Отменено"; return ;;
+        p|P)
+            read -rp "  Путь к каталогу: " source_path
+            if [[ -z "$source_path" ]]; then
+                log_warn "Путь пустой, отменено"
+                return
+            fi
+            # Удаляем trailing slash чтобы не путаться при mv/cp -a
+            source_path="${source_path%/}"
+            if [[ ! -d "$source_path" ]]; then
+                log_error "Каталог не существует: ${source_path}"
+                return 1
+            fi
+            # Защита от случайного "усыновления" самого INST_REPO_DIR
+            local source_real inst_real
+            source_real=$(readlink -f "$source_path" 2>/dev/null || echo "$source_path")
+            inst_real=$(readlink -f "$INST_REPO_DIR" 2>/dev/null || echo "$INST_REPO_DIR")
+            if [[ "$source_real" == "$inst_real" ]]; then
+                log_error "Нельзя усыновить сам каталог хранилищ инстанса"
+                return 1
+            fi
+            # Если путь УЖЕ внутри INST_REPO_DIR (например, пользователь
+            # ввёл полный путь до осиротевшего) — будем «легализовать»,
+            # а не копировать.
+            if [[ "$source_real" == "$inst_real"/* ]]; then
+                echo ""
+                echo "  Каталог уже внутри ${INST_REPO_DIR} — будет переименован/легализован."
+            else
+                echo ""
+                echo "  Источник: ${source_path}"
+                echo "  Будет добавлен в ${INST_REPO_DIR}/. Скопировать или переместить?"
+                echo "    1) Скопировать (источник останется на месте, безопаснее)"
+                echo "    2) Переместить (источник исчезнет, экономит место)"
+                echo "    0) Отмена"
+                read -rp "  Выберите [1]: " mv_choice
+                case "${mv_choice:-1}" in
+                    1) move_mode=0 ;;
+                    2) move_mode=1 ;;
+                    *) log_warn "Отменено"; return ;;
+                esac
+            fi
+            ;;
+        *)
+            if ! [[ "$src_choice" =~ ^[0-9]+$ ]] || (( src_choice < 1 || src_choice > ${#orphans[@]} )); then
+                log_error "Неверный номер"
+                return 1
+            fi
+            source_path="${INST_REPO_DIR}/${orphans[$((src_choice - 1))]}"
+            ;;
+    esac
+
+    # 2. Спрашиваем имя для нового хранилища. Дефолт — basename источника
+    #    (если валиден); если невалиден, очищаем спецсимволы.
+    local default_name
+    default_name=$(basename "$source_path")
+    # Срезаем .pre-restore.* суффикс если он есть
+    if [[ "$default_name" == *.pre-restore.* ]]; then
+        default_name="${default_name%%.pre-restore.*}"
+    fi
+    # Если всё ещё невалидно — оставим пустым, заставим ввести
+    if ! validate_repo_name "$default_name"; then
+        default_name=""
+    fi
+    echo ""
+    if [[ -n "$default_name" ]]; then
+        read -rp "  Имя хранилища [${default_name}]: " repo_name
+        repo_name="${repo_name:-$default_name}"
+    else
+        read -rp "  Имя хранилища: " repo_name
+    fi
+    if ! validate_repo_name "$repo_name"; then
+        log_error "Недопустимое имя: '${repo_name}' (нужно [A-Za-z0-9_-], 1..64 символа)"
+        return 1
+    fi
+    local target="${INST_REPO_DIR}/${repo_name}"
+    if [[ -e "$target" ]]; then
+        # Особый случай: source_path == target (легализация без переименования).
+        local _src_real _tgt_real
+        _src_real=$(readlink -f "$source_path" 2>/dev/null || echo "$source_path")
+        _tgt_real=$(readlink -f "$target" 2>/dev/null || echo "$target")
+        if [[ "$_src_real" != "$_tgt_real" ]]; then
+            log_error "Цель уже занята: ${target}"
+            return 1
+        fi
+    fi
+
+    # 3. Валидация структуры (предупреждение, не блок)
+    if ! repo_looks_initialized "$source_path"; then
+        echo ""
+        log_warn "В каталоге не обнаружены признаки хранилища 1С"
+        log_warn "  (нет 1cv8ddb.lst / cache/ / data/ / v8inforeg.lst)"
+        echo "  Можно подключить как пустую заготовку (структуру создаст конфигуратор)."
+        if ! confirm "Продолжить" no; then
+            log_warn "Отменено"
+            return
+        fi
+    fi
+
+    # 4. Нужно остановить службу, если она использует REPO_DIR (на всякий
+    #    случай — для атомарности перемещения и chown).
+    local unit="crserver@${INST_NAME}.service"
+    local was_active=0
+    if systemctl is-active --quiet "$unit" 2>/dev/null; then
+        was_active=1
+        log_step "Остановка ${unit} на время операции..."
+        systemctl stop "$unit" 2>/dev/null || true
+        sleep 1
+    fi
+
+    # 5. Переносим/копируем источник → target (если они не один и тот же).
+    local _src_real _tgt_real
+    _src_real=$(readlink -f "$source_path" 2>/dev/null || echo "$source_path")
+    _tgt_real=$(readlink -f "$target" 2>/dev/null || echo "$target")
+    if [[ "$_src_real" != "$_tgt_real" ]]; then
+        if [[ "$src_choice" == "p" || "$src_choice" == "P" ]] && (( move_mode == 0 )); then
+            # Копируем
+            log_step "Копирование ${source_path} → ${target}..."
+            if ! cp -a "$source_path" "$target"; then
+                log_error "cp -a не удался"
+                rm -rf "$target" 2>/dev/null || true
+                if [[ $was_active -eq 1 ]]; then
+                    systemctl start "$unit" 2>/dev/null || true
+                fi
+                return 1
+            fi
+        else
+            # Перемещаем (mv внутри той же ФС — атомарный rename)
+            log_step "Перемещение ${source_path} → ${target}..."
+            if ! mv "$source_path" "$target"; then
+                # mv может упасть если источник на другой ФС — попробуем move_dir_safe
+                if ! move_dir_safe "$source_path" "$target"; then
+                    log_error "Не удалось переместить каталог"
+                    if [[ $was_active -eq 1 ]]; then
+                        systemctl start "$unit" 2>/dev/null || true
+                    fi
+                    return 1
+                fi
+            fi
+        fi
+    fi
+
+    # 6. Права и владелец
+    chown -R "${SVC_USER}:${SVC_GROUP}" "$target" 2>/dev/null || \
+        log_warn "chown -R завершился с ошибкой"
+    chmod 750 "$target" 2>/dev/null || true
+
+    # 7. Запускаем службу обратно
+    if [[ $was_active -eq 1 ]]; then
+        if ! systemctl start "$unit" 2>/dev/null; then
+            log_warn "Служба не стартовала — journalctl -u ${unit}"
+        fi
+    fi
+
+    local ip_addr
+    ip_addr=$(get_primary_ip)
+    log_info "Хранилище '${repo_name}' подключено"
+    echo "    Путь:   ${target}"
+    echo "    Адрес:  tcp://${ip_addr}:${INST_PORT}/${repo_name}"
+    if repo_looks_initialized "$target"; then
+        echo "    Статус: инициализированное (можно подключаться из конфигуратора)"
+    else
+        echo "    Статус: пустая заготовка (для нового хранилища — Создать в конфигураторе)"
+    fi
 }
 
 _select_repo_interactive() {
@@ -4198,6 +4433,8 @@ do_help() {
     echo "    sudo ./crserver-manager.sh repo rename <старое> <новое>"
     echo "    sudo ./crserver-manager.sh repo backup <имя>"
     echo "    sudo ./crserver-manager.sh repo restore <архив|имя> [--as <new>] [--force]"
+    echo "    sudo ./crserver-manager.sh repo adopt <путь> [--as <имя>] [--move|--copy] [--force]"
+    echo "                                                       подключить существующий каталог как хранилище"
     echo ""
     echo "  Обновление:"
     echo "    sudo ./crserver-manager.sh update [--check|--force]"
@@ -4904,8 +5141,122 @@ cli_run_on_instance() {
                     log_info "Восстановлено: ${target_name} (из $(basename "$archive"))"
                     [[ -n "$rollback_dir" ]] && echo "  Прежний вариант: ${rollback_dir}"
                     ;;
+                adopt)
+                    # Использование:
+                    #   repo adopt <путь> [--as <имя>] [--move|--copy] [--force]
+                    # Если <путь> уже внутри INST_REPO_DIR — легализуется без перемещения.
+                    # Иначе по умолчанию --copy. --move перемещает источник.
+                    # --force — не предупреждать об отсутствии 1С-структуры.
+                    if [[ -z "${1:-}" ]]; then
+                        log_error "Использование: $0 [-i name] repo adopt <путь> [--as <имя>] [--move|--copy] [--force]"
+                        return 1
+                    fi
+                    local _src_path="$1"; shift || true
+                    _src_path="${_src_path%/}"
+                    local _new_name="" _adopt_op="copy" _adopt_force=0
+                    while [[ $# -gt 0 ]]; do
+                        case "$1" in
+                            --as)    _new_name="${2:-}"; shift 2 ;;
+                            --move)  _adopt_op="move"; shift ;;
+                            --copy)  _adopt_op="copy"; shift ;;
+                            --force) _adopt_force=1;   shift ;;
+                            *) log_error "Неизвестный аргумент: $1"; return 1 ;;
+                        esac
+                    done
+
+                    if [[ ! -d "$_src_path" ]]; then
+                        log_error "Каталог не существует: ${_src_path}"
+                        return 1
+                    fi
+
+                    detect_1c_user
+                    if [[ -z "${SVC_USER:-}" || -z "${SVC_GROUP:-}" ]]; then
+                        log_error "Не определён пользователь usr1cv8"
+                        return 1
+                    fi
+
+                    # Защита от усыновления самого INST_REPO_DIR
+                    local _src_real _inst_real
+                    _src_real=$(readlink -f "$_src_path" 2>/dev/null || echo "$_src_path")
+                    _inst_real=$(readlink -f "$INST_REPO_DIR" 2>/dev/null || echo "$INST_REPO_DIR")
+                    if [[ "$_src_real" == "$_inst_real" ]]; then
+                        log_error "Нельзя усыновить сам каталог хранилищ инстанса"
+                        return 1
+                    fi
+
+                    # Имя хранилища
+                    if [[ -z "$_new_name" ]]; then
+                        _new_name=$(basename "$_src_path")
+                        _new_name="${_new_name%%.pre-restore.*}"
+                    fi
+                    if ! validate_repo_name "$_new_name"; then
+                        log_error "Недопустимое имя: '${_new_name}' (используйте --as <имя>)"
+                        return 1
+                    fi
+                    local _target="${INST_REPO_DIR}/${_new_name}"
+
+                    # Если путь уже внутри INST_REPO_DIR — легализация (mv внутри).
+                    local _internal=0
+                    if [[ "$_src_real" == "$_inst_real"/* ]]; then
+                        _internal=1
+                    fi
+
+                    if [[ -e "$_target" ]]; then
+                        local _tgt_real
+                        _tgt_real=$(readlink -f "$_target" 2>/dev/null || echo "$_target")
+                        if [[ "$_src_real" != "$_tgt_real" ]]; then
+                            log_error "Цель уже занята: ${_target}"
+                            return 1
+                        fi
+                    fi
+
+                    if (( _adopt_force == 0 )) && ! repo_looks_initialized "$_src_path"; then
+                        log_error "В ${_src_path} нет признаков хранилища 1С (нет 1cv8ddb.lst/cache/data/v8inforeg.lst). Используйте --force для подключения как пустой заготовки."
+                        return 1
+                    fi
+
+                    # Останавливаем службу
+                    local _was_active=0
+                    if systemctl is-active --quiet "$unit" 2>/dev/null; then
+                        _was_active=1
+                        systemctl stop "$unit" 2>/dev/null || true
+                        sleep 1
+                    fi
+
+                    # Если src и target — один и тот же путь (легализация без переименования)
+                    # — не двигаем, только chown.
+                    if [[ "$_src_real" != "$(readlink -f "$_target" 2>/dev/null || echo "$_target")" ]]; then
+                        if (( _internal == 1 )) || [[ "$_adopt_op" == "move" ]]; then
+                            if ! mv "$_src_path" "$_target"; then
+                                if ! move_dir_safe "$_src_path" "$_target"; then
+                                    log_error "Не удалось переместить каталог"
+                                    [[ $_was_active -eq 1 ]] && systemctl start "$unit" 2>/dev/null || true
+                                    return 1
+                                fi
+                            fi
+                        else
+                            # copy
+                            if ! cp -a "$_src_path" "$_target"; then
+                                log_error "cp -a не удался"
+                                rm -rf "$_target" 2>/dev/null || true
+                                [[ $_was_active -eq 1 ]] && systemctl start "$unit" 2>/dev/null || true
+                                return 1
+                            fi
+                        fi
+                    fi
+
+                    chown -R "${SVC_USER}:${SVC_GROUP}" "$_target" 2>/dev/null || true
+                    chmod 750 "$_target" 2>/dev/null || true
+
+                    if [[ $_was_active -eq 1 ]]; then
+                        systemctl start "$unit" 2>/dev/null || \
+                            log_warn "Служба не стартовала — journalctl -u ${unit}"
+                    fi
+
+                    log_info "Хранилище '${_new_name}' подключено: ${_target}"
+                    ;;
                 *)
-                    log_error "Использование: $0 [-i name] repo {list|info <имя>|create <имя>|delete <имя>|rename <ст> <нв>|backup <имя>|restore <архив|имя>}"
+                    log_error "Использование: $0 [-i name] repo {list|info <имя>|create <имя>|delete <имя>|rename <ст> <нв>|backup <имя>|restore <архив|имя>|adopt <путь> [--as <имя>] [--move|--copy] [--force]}"
                     return 1
                     ;;
             esac
