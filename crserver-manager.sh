@@ -33,7 +33,7 @@ set -euo pipefail
 # --- Версия скрипта ---
 # При выпуске новой версии увеличить и закоммитить в репозиторий.
 # Используется для проверки обновлений (см. do_self_update).
-SCRIPT_VERSION="2.3.0"
+SCRIPT_VERSION="2.3.1"
 
 # --- Источник обновлений ---
 UPDATE_REPO="evengenius/1c-crserver-manager"
@@ -177,6 +177,16 @@ confirm() {
         return $?
     fi
     [[ "$ans" =~ ^[Yy]$ ]]
+}
+
+# Тримминг ведущих/хвостовых пробельных символов (\s = пробел, таб, CR, LF).
+# Нужен после `read -rp` для имён, чтобы случайный пробел/CR из копипаста
+# не валил валидацию ^[A-Za-z0-9_-]+$.
+_trim_ws() {
+    local s="$1"
+    s="${s#"${s%%[![:space:]]*}"}"
+    s="${s%"${s##*[![:space:]]}"}"
+    printf '%s' "$s"
 }
 
 # --- Контекст текущего инстанса (заполняется select_instance / instance_load) ---
@@ -727,6 +737,7 @@ migrate_legacy() {
     echo "    6. Сохранение старого crserver.conf как .legacy для подстраховки"
     echo ""
     read -rp "  Имя инстанса [default]: " new_name
+    new_name=$(_trim_ws "$new_name")
     new_name="${new_name:-default}"
     if ! instance_name_valid "$new_name"; then
         log_error "Недопустимое имя: '${new_name}' (нужно ^[a-z][a-z0-9-]{0,31}$)"
@@ -1272,6 +1283,7 @@ do_instance_create() {
     echo "  Создание нового инстанса"
     echo "  ─────────────────────────────────────────────"
     read -rp "  Имя (a-z, цифры, дефисы; до 32 символов): " name
+    name=$(_trim_ws "$name")
     if ! instance_name_valid "$name"; then
         log_error "Недопустимое имя"
         return
@@ -1416,6 +1428,7 @@ do_instance_delete() {
 
     echo ""
     read -rp "  Введите имя инстанса '${name}' для подтверждения: " confirm
+    confirm=$(_trim_ws "$confirm")
     if [[ "$confirm" != "$name" ]]; then
         log_warn "Отменено (имя не совпало)"
         return
@@ -1743,6 +1756,7 @@ do_full_install() {
 
     echo ""
     read -rp "  Имя инстанса [default]: " inst_name
+    inst_name=$(_trim_ws "$inst_name")
     inst_name="${inst_name:-default}"
     if ! instance_name_valid "$inst_name"; then
         log_error "Недопустимое имя инстанса"
@@ -2139,6 +2153,7 @@ do_repo_list_detailed() {
 do_repo_create() {
     echo ""
     read -rp "  Имя нового хранилища: " name
+    name=$(_trim_ws "$name")
     if ! validate_repo_name "$name"; then
         log_error "Недопустимое имя"
         return 1
@@ -2302,9 +2317,11 @@ do_repo_adopt() {
     echo ""
     if [[ -n "$default_name" ]]; then
         read -rp "  Имя хранилища [${default_name}]: " repo_name
+        repo_name=$(_trim_ws "$repo_name")
         repo_name="${repo_name:-$default_name}"
     else
         read -rp "  Имя хранилища: " repo_name
+        repo_name=$(_trim_ws "$repo_name")
     fi
     if ! validate_repo_name "$repo_name"; then
         log_error "Недопустимое имя: '${repo_name}' (нужно [A-Za-z0-9_-], 1..64 символа)"
@@ -2471,6 +2488,7 @@ do_repo_rename() {
     log_warn "Переименование разорвёт URL подключения у клиентов!"
     echo "    Было:   tcp://...:${INST_PORT}/${old_name}"
     read -rp "  Новое имя: " new_name
+    new_name=$(_trim_ws "$new_name")
     if ! validate_repo_name "$new_name"; then
         log_error "Недопустимое имя"
         return 1
@@ -2527,6 +2545,7 @@ do_repo_delete() {
     log_warn "Это необратимо. Рекомендуется сначала сделать бэкап."
     echo ""
     read -rp "  Введите имя хранилища '${name}' для подтверждения: " confirm
+    confirm=$(_trim_ws "$confirm")
     if [[ "$confirm" != "$name" ]]; then
         log_warn "Отменено (имя не совпало)"
         return
@@ -2722,6 +2741,7 @@ do_repo_restore() {
                 done
                 default_target="${candidate}${suffix}"
                 read -rp "  Новое имя [${default_target}]: " target_name
+                target_name=$(_trim_ws "$target_name")
                 target_name="${target_name:-$default_target}"
                 ;;
             *) log_warn "Отменено"; return ;;
@@ -2731,6 +2751,7 @@ do_repo_restore() {
         # именем или ввести своё (на случай если хочется переименовать сразу).
         echo "  Хранилище '${orig_name}' не существует — будет создано."
         read -rp "  Восстановить под именем [${orig_name}] (Enter — да): " mode
+        mode=$(_trim_ws "$mode")
         target_name="${mode:-$orig_name}"
     fi
 
@@ -2750,6 +2771,7 @@ do_repo_restore() {
         echo ""
         log_warn "Будет ЗАМЕНЕНО хранилище '${target_name}' (старая версия сохранится как .pre-restore)"
         read -rp "  Введите '${target_name}' для подтверждения замены: " confirm
+        confirm=$(_trim_ws "$confirm")
         if [[ "$confirm" != "$target_name" ]]; then
             log_warn "Отменено"
             return
