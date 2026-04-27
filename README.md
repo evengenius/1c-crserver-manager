@@ -2,7 +2,7 @@
 
 **1c-crserver-manager** — bash-скрипт для автоматизации развёртывания и администрирования сервера хранилища конфигураций 1С:Предприятие (`crserver`) на Linux. **Поддерживает несколько независимых инстансов** на одном сервере: каждый со своей версией платформы, своим портом и каталогом хранилищ. Включает интерактивное меню, CLI-команды, файрвол, бэкапы и самообновление из репозитория.
 
-Текущая версия: **2.1.3** (мульти-инстанс) — [история изменений](CHANGELOG.md), [план развития](ROADMAP.md)
+Текущая версия: **2.1.4** (мульти-инстанс) — [история изменений](CHANGELOG.md), [план развития](ROADMAP.md)
 
 > **Если вы обновляетесь с v1.x**: установка станет **multi-instance** автоматически. Меню «Инстансы → Миграция со старой установки» предложит безопасно перенести существующий `crserver.service` в инстанс с именем `default` (с переносом каталога хранилищ). Простой ~10 секунд.
 
@@ -173,7 +173,9 @@ sudo crserver -i dev30 repo info trade_dev
 sudo crserver -i dev30 repo create trade_dev
 sudo crserver -i dev30 repo rename trade_dev trade_prod
 sudo crserver -i dev30 repo backup trade_dev
-sudo crserver -i dev30 repo restore trade_dev          # последний бэкап с этим именем
+sudo crserver -i dev30 repo restore trade_dev                                       # последний бэкап с этим именем
+sudo crserver -i dev30 repo restore trade_dev --as trade_dev_test                   # восстановить как новое хранилище
+sudo crserver -i dev30 repo restore trade_dev --force                               # заменить существующее без подтверждения
 sudo crserver -i dev30 repo restore /var/1c/backup/dev30_repo_trade_dev_20260101_120000.tar.gz
 sudo crserver -i dev30 repo delete trade_dev
 ```

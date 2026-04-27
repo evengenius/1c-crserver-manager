@@ -33,7 +33,7 @@ set -euo pipefail
 # --- Версия скрипта ---
 # При выпуске новой версии увеличить и закоммитить в репозиторий.
 # Используется для проверки обновлений (см. do_self_update).
-SCRIPT_VERSION="2.1.3"
+SCRIPT_VERSION="2.1.4"
 
 # --- Источник обновлений ---
 UPDATE_REPO="evengenius/1c-crserver-manager"
@@ -2368,7 +2368,7 @@ do_repo_restore() {
 
     local archive="${backups[$((num - 1))]}"
     # Все записи архива должны лежать в одном top-level каталоге с допустимым именем.
-    local top_dirs name
+    local top_dirs orig_name
     top_dirs=$(tar -tzf "$archive" 2>/dev/null | awk -F/ 'NF>0 && $1!="" {print $1}' | sort -u)
     if [[ -z "$top_dirs" ]]; then
         log_error "Не удалось прочитать содержимое архива"
@@ -2379,21 +2379,77 @@ do_repo_restore() {
         printf '%s\n' "$top_dirs" | sed 's/^/    /'
         return 1
     fi
-    name="$top_dirs"
-    if ! validate_repo_name "$name"; then
-        log_error "Имя каталога в архиве не похоже на имя хранилища: '${name}'"
+    orig_name="$top_dirs"
+    if ! validate_repo_name "$orig_name"; then
+        log_error "Имя каталога в архиве не похоже на имя хранилища: '${orig_name}'"
+        return 1
+    fi
+
+    # Проверим, что в архиве top-level именно ДИРЕКТОРИЯ (entry с trailing /),
+    # а не файл с этим именем — иначе после tar -xzf вместо хранилища
+    # на диске окажется обычный файл, и хранилища как такового не будет.
+    if ! tar -tzf "$archive" 2>/dev/null | grep -q "^${orig_name}/$\|^${orig_name}/."; then
+        log_error "В архиве top-level '${orig_name}' не является директорией"
         return 1
     fi
 
     echo ""
-    echo "  Архив:      $(basename "$archive")"
-    echo "  Хранилище:  ${name}"
-    local target="${INST_REPO_DIR}/${name}"
-    if [[ -e "$target" ]]; then
+    echo "  Архив:        $(basename "$archive")"
+    echo "  В архиве:     ${orig_name}/"
+    echo ""
+
+    # Решаем КУДА восстанавливать.
+    local target_name=""
+    local default_target="$orig_name"
+    if [[ -e "${INST_REPO_DIR}/${orig_name}" ]]; then
+        echo "  Хранилище '${orig_name}' уже существует на диске."
+        echo "  Варианты восстановления:"
+        echo "    1) Заменить существующее '${orig_name}' (со страховочным rollback)"
+        echo "    2) Восстановить под другим именем (как новое хранилище)"
+        echo "    0) Отмена"
+        read -rp "  Выберите [0]: " mode
+        case "${mode:-0}" in
+            1) target_name="$orig_name" ;;
+            2)
+                # Подскажем свободное имя по умолчанию: <orig>_restored или
+                # <orig>_restored_2 и т.д.
+                local suffix="" candidate="${orig_name}_restored"
+                local n=2
+                while [[ -e "${INST_REPO_DIR}/${candidate}${suffix}" ]]; do
+                    suffix="_${n}"
+                    n=$((n + 1))
+                done
+                default_target="${candidate}${suffix}"
+                read -rp "  Новое имя [${default_target}]: " target_name
+                target_name="${target_name:-$default_target}"
+                ;;
+            *) log_warn "Отменено"; return ;;
+        esac
+    else
+        # Целевого имени на диске нет — спросим, восстанавливать под исходным
+        # именем или ввести своё (на случай если хочется переименовать сразу).
+        echo "  Хранилище '${orig_name}' не существует — будет создано."
+        read -rp "  Восстановить под именем [${orig_name}] (Enter — да): " mode
+        target_name="${mode:-$orig_name}"
+    fi
+
+    if ! validate_repo_name "$target_name"; then
+        log_error "Недопустимое имя: '${target_name}'"
+        return 1
+    fi
+    local target="${INST_REPO_DIR}/${target_name}"
+    # Если выбрали "под другим именем" но новое имя ВСЁ РАВНО уже занято —
+    # отказ (лучше явно, чем неожиданно затереть).
+    if [[ "$target_name" != "$orig_name" && -e "$target" ]]; then
+        log_error "Целевое имя '${target_name}' уже занято: ${target}"
+        return 1
+    fi
+
+    if [[ "$target_name" == "$orig_name" && -e "$target" ]]; then
         echo ""
-        log_warn "Хранилище '${name}' уже существует и БУДЕТ ЗАМЕНЕНО"
-        read -rp "  Введите '${name}' для подтверждения замены: " confirm
-        if [[ "$confirm" != "$name" ]]; then
+        log_warn "Будет ЗАМЕНЕНО хранилище '${target_name}' (старая версия сохранится как .pre-restore)"
+        read -rp "  Введите '${target_name}' для подтверждения замены: " confirm
+        if [[ "$confirm" != "$target_name" ]]; then
             log_warn "Отменено"
             return
         fi
@@ -2408,6 +2464,7 @@ do_repo_restore() {
         sleep 1
     fi
 
+    # Страховка: если заменяем существующее — отодвигаем в .pre-restore.
     local rollback_dir=""
     if [[ -e "$target" ]]; then
         rollback_dir="${target}.pre-restore.$(date +%s)"
@@ -2419,9 +2476,10 @@ do_repo_restore() {
         log_error "Ошибка распаковки:"
         tail -5 /tmp/crserver-tar.log | sed 's/^/    /'
         rm -f /tmp/crserver-tar.log
+        # Откат
+        rm -rf "${INST_REPO_DIR:?}/${orig_name:?}" 2>/dev/null || true
         if [[ -n "$rollback_dir" ]]; then
             log_warn "Восстанавливаю предыдущее состояние..."
-            rm -rf "$target" 2>/dev/null || true
             mv "$rollback_dir" "$target"
         fi
         if [[ $was_active -eq 1 ]]; then
@@ -2431,14 +2489,50 @@ do_repo_restore() {
     fi
     rm -f /tmp/crserver-tar.log
 
+    # Если восстанавливаем под другим именем — переименуем распакованный
+    # каталог из orig_name в target_name.
+    if [[ "$target_name" != "$orig_name" ]]; then
+        if ! mv "${INST_REPO_DIR}/${orig_name}" "$target"; then
+            log_error "Не удалось переименовать ${orig_name} → ${target_name}"
+            rm -rf "${INST_REPO_DIR:?}/${orig_name:?}" 2>/dev/null || true
+            if [[ -n "$rollback_dir" ]]; then
+                mv "$rollback_dir" "${INST_REPO_DIR}/${orig_name}"
+            fi
+            if [[ $was_active -eq 1 ]]; then
+                systemctl start "$unit" 2>/dev/null || true
+            fi
+            return 1
+        fi
+    fi
+
+    # Post-condition: на диске ДОЛЖНА появиться директория хранилища.
+    if [[ ! -d "$target" ]]; then
+        log_error "После распаковки '${target}' не является директорией. Возможно, архив повреждён или содержит файл вместо каталога."
+        # Откат
+        if [[ -n "$rollback_dir" ]]; then
+            rm -f "$target" 2>/dev/null || true
+            mv "$rollback_dir" "$target"
+        fi
+        if [[ $was_active -eq 1 ]]; then
+            systemctl start "$unit" 2>/dev/null || true
+        fi
+        return 1
+    fi
+
     detect_1c_user
     if [[ -n "${SVC_USER:-}" && -n "${SVC_GROUP:-}" ]]; then
         chown -R "${SVC_USER}:${SVC_GROUP}" "$target"
     fi
 
-    log_info "Восстановлено: ${name}"
+    local ip_addr
+    ip_addr=$(get_primary_ip)
+    log_info "Восстановлено: ${target_name}"
+    echo "    Путь:    ${target}"
+    echo "    Адрес:   tcp://${ip_addr}:${INST_PORT}/${target_name}"
     if [[ -n "$rollback_dir" ]]; then
-        echo "  Прежний вариант сохранён: ${rollback_dir}"
+        echo "    Прежний вариант: ${rollback_dir}"
+        echo "    Удалить вручную если откат не понадобится:"
+        echo "      sudo rm -rf '${rollback_dir}'"
     fi
 
     if [[ $was_active -eq 1 ]]; then
@@ -3860,7 +3954,7 @@ do_help() {
     echo "    sudo ./crserver-manager.sh repo delete <имя>"
     echo "    sudo ./crserver-manager.sh repo rename <старое> <новое>"
     echo "    sudo ./crserver-manager.sh repo backup <имя>"
-    echo "    sudo ./crserver-manager.sh repo restore <архив.tar.gz | имя_хранилища>"
+    echo "    sudo ./crserver-manager.sh repo restore <архив|имя> [--as <new>] [--force]"
     echo ""
     echo "  Обновление:"
     echo "    sudo ./crserver-manager.sh update [--check|--force]"
@@ -4405,51 +4499,84 @@ cli_run_on_instance() {
                     fi
                     ;;
                 restore)
-                    # Использование: repo restore <архив|имя_файла>
-                    # Если передано полное имя файла — берём как есть. Иначе ищем в BACKUP_DIR
-                    # последний бэкап для этого имени хранилища у текущего инстанса.
+                    # Использование:
+                    #   repo restore <архив.tar.gz | имя_хранилища> [--as <new>] [--force]
+                    # --as <new>    — восстановить под другим именем (как новое хранилище)
+                    # --force       — не запрашивать подтверждение замены
                     if [[ -z "${1:-}" ]]; then
-                        log_error "Использование: $0 [-i name] repo restore <архив.tar.gz | имя_хранилища>"
+                        log_error "Использование: $0 [-i name] repo restore <архив.tar.gz | имя_хранилища> [--as <new>] [--force]"
                         return 1
                     fi
+                    local _src="$1"; shift || true
+                    local _as="" _force=0
+                    while [[ $# -gt 0 ]]; do
+                        case "$1" in
+                            --as) _as="${2:-}"; shift 2 ;;
+                            --force) _force=1; shift ;;
+                            *) log_error "Неизвестный аргумент: $1"; return 1 ;;
+                        esac
+                    done
+
                     local archive=""
-                    if [[ -f "$1" ]]; then
-                        archive="$1"
+                    if [[ -f "$_src" ]]; then
+                        archive="$_src"
                     else
-                        if ! validate_repo_name "$1"; then
-                            log_error "Недопустимое имя или файл не найден: $1"
+                        if ! validate_repo_name "$_src"; then
+                            log_error "Недопустимое имя или файл не найден: $_src"
                             return 1
                         fi
-                        # Берём свежайший бэкап
                         archive=$(find "$BACKUP_DIR" -maxdepth 1 \
-                            -name "${INST_NAME}_repo_${1}_*.tar.gz" -printf '%T@ %p\n' 2>/dev/null \
+                            -name "${INST_NAME}_repo_${_src}_*.tar.gz" -printf '%T@ %p\n' 2>/dev/null \
                             | sort -nr | head -1 | cut -d' ' -f2-)
                         if [[ -z "$archive" ]]; then
-                            log_error "Бэкапы для '${1}' не найдены в ${BACKUP_DIR}"
+                            log_error "Бэкапы для '${_src}' не найдены в ${BACKUP_DIR}"
                             return 1
                         fi
                     fi
 
                     # Валидируем содержимое архива
-                    local top_dirs name
+                    local top_dirs orig_name
                     top_dirs=$(tar -tzf "$archive" 2>/dev/null | awk -F/ 'NF>0 && $1!="" {print $1}' | sort -u)
                     if [[ -z "$top_dirs" || $(printf '%s\n' "$top_dirs" | wc -l) -ne 1 ]]; then
                         log_error "Архив пуст или содержит несколько top-level каталогов"
                         return 1
                     fi
-                    name="$top_dirs"
-                    if ! validate_repo_name "$name"; then
-                        log_error "Имя в архиве не похоже на имя хранилища: '${name}'"
+                    orig_name="$top_dirs"
+                    if ! validate_repo_name "$orig_name"; then
+                        log_error "Имя в архиве не похоже на имя хранилища: '${orig_name}'"
+                        return 1
+                    fi
+                    if ! tar -tzf "$archive" 2>/dev/null | grep -q "^${orig_name}/$\|^${orig_name}/."; then
+                        log_error "В архиве top-level '${orig_name}' не является директорией"
                         return 1
                     fi
 
-                    local target="${INST_REPO_DIR}/${name}"
+                    # Целевое имя
+                    local target_name="${_as:-$orig_name}"
+                    if ! validate_repo_name "$target_name"; then
+                        log_error "Недопустимое --as имя: '${target_name}'"
+                        return 1
+                    fi
+                    local target="${INST_REPO_DIR}/${target_name}"
+
+                    if [[ -e "$target" ]]; then
+                        if [[ "$target_name" != "$orig_name" ]]; then
+                            log_error "Целевое имя '${target_name}' уже занято: ${target}"
+                            return 1
+                        fi
+                        if [[ $_force -eq 0 ]]; then
+                            log_error "Хранилище '${target_name}' существует. Используйте --force для замены или --as <new> для восстановления как новое."
+                            return 1
+                        fi
+                    fi
+
                     local was_active=0
                     if systemctl is-active --quiet "$unit" 2>/dev/null; then
                         was_active=1
                         systemctl stop "$unit" 2>/dev/null || true
                         sleep 1
                     fi
+
                     local rollback_dir=""
                     if [[ -e "$target" ]]; then
                         rollback_dir="${target}.pre-restore.$(date +%s)"
@@ -4457,8 +4584,30 @@ cli_run_on_instance() {
                     fi
                     if ! tar -xzf "$archive" -C "$INST_REPO_DIR" 2>/dev/null; then
                         log_error "Ошибка распаковки"
-                        rm -rf "$target" 2>/dev/null || true
+                        rm -rf "${INST_REPO_DIR:?}/${orig_name:?}" 2>/dev/null || true
                         [[ -n "$rollback_dir" ]] && mv "$rollback_dir" "$target"
+                        if [[ $was_active -eq 1 ]]; then
+                            systemctl start "$unit" 2>/dev/null || true
+                        fi
+                        return 1
+                    fi
+                    if [[ "$target_name" != "$orig_name" ]]; then
+                        if ! mv "${INST_REPO_DIR}/${orig_name}" "$target"; then
+                            log_error "Не удалось переименовать ${orig_name} → ${target_name}"
+                            rm -rf "${INST_REPO_DIR:?}/${orig_name:?}" 2>/dev/null || true
+                            [[ -n "$rollback_dir" ]] && mv "$rollback_dir" "${INST_REPO_DIR}/${orig_name}"
+                            if [[ $was_active -eq 1 ]]; then
+                                systemctl start "$unit" 2>/dev/null || true
+                            fi
+                            return 1
+                        fi
+                    fi
+                    if [[ ! -d "$target" ]]; then
+                        log_error "После распаковки '${target}' не директория. Архив повреждён?"
+                        if [[ -n "$rollback_dir" ]]; then
+                            rm -f "$target" 2>/dev/null || true
+                            mv "$rollback_dir" "$target"
+                        fi
                         if [[ $was_active -eq 1 ]]; then
                             systemctl start "$unit" 2>/dev/null || true
                         fi
@@ -4472,7 +4621,7 @@ cli_run_on_instance() {
                         systemctl start "$unit" 2>/dev/null || \
                             log_warn "Служба не стартовала — journalctl -u ${unit}"
                     fi
-                    log_info "Восстановлено: ${name} (из $(basename "$archive"))"
+                    log_info "Восстановлено: ${target_name} (из $(basename "$archive"))"
                     [[ -n "$rollback_dir" ]] && echo "  Прежний вариант: ${rollback_dir}"
                     ;;
                 *)
