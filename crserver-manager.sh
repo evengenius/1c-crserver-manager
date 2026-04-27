@@ -33,7 +33,7 @@ set -euo pipefail
 # --- Версия скрипта ---
 # При выпуске новой версии увеличить и закоммитить в репозиторий.
 # Используется для проверки обновлений (см. do_self_update).
-SCRIPT_VERSION="2.1.4"
+SCRIPT_VERSION="2.2.0"
 
 # --- Источник обновлений ---
 UPDATE_REPO="evengenius/1c-crserver-manager"
@@ -62,6 +62,14 @@ BACKUP_DIR="${DEFAULT_BACKUP_DIR}"
 IPTABLES_CHAIN="CRSERVER"
 PACKAGES_DIR_NAME="packages"
 
+# --- Журнал ошибок ---
+# Все вызовы log_error дублируются сюда. Файл создаётся при первой
+# ошибке (если есть права). Ротация: при превышении LOG_MAX_BYTES
+# текущий файл сохраняется как .1, новые ошибки идут в свежий.
+ERROR_LOG_DIR="/var/log/1c-crserver"
+ERROR_LOG_FILE="${ERROR_LOG_DIR}/manager.log"
+ERROR_LOG_MAX_BYTES=5242880   # 5 MiB
+
 # --- Пути (вычисляются при запуске) ---
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PACKAGES_DIR="${SCRIPT_DIR}/${PACKAGES_DIR_NAME}"
@@ -82,8 +90,47 @@ fi
 # --- Логирование ---
 log_info()  { echo -e "${GREEN}[✓]${NC} $1"; }
 log_warn()  { echo -e "${YELLOW}[!]${NC} $1"; }
-log_error() { echo -e "${RED}[✗]${NC} $1"; }
+log_error() { echo -e "${RED}[✗]${NC} $1"; _error_log_write "ERROR" "$1"; }
 log_step()  { echo -e "${CYAN}[→]${NC} $1"; }
+
+# Пишет запись в файл журнала ошибок (см. ERROR_LOG_FILE).
+# Формат: 2026-04-27T15:00:00+0300 LEVEL [func@line] [inst=name] message
+# При ошибке записи (нет прав, диск полон) — молча игнорируем, чтобы
+# не сломать пользовательский поток. На stderr ничего не пишем тоже,
+# иначе ошибка лога стала бы новой ошибкой.
+#   $1 — уровень (ERROR/WARN/...)
+#   $2 — текст сообщения
+_error_log_write() {
+    local level="$1" msg="$2"
+    # Пытаемся создать каталог только если есть EUID (не --version/help до root-check)
+    if ! mkdir -p "$ERROR_LOG_DIR" 2>/dev/null; then
+        return 0
+    fi
+    # Ротация по размеру: если текущий файл слишком большой —
+    # сдвигаем .1 → .2 (последняя), сохраняем текущий как .1.
+    if [[ -f "$ERROR_LOG_FILE" ]]; then
+        local _size
+        _size=$(stat -c '%s' "$ERROR_LOG_FILE" 2>/dev/null || echo 0)
+        if [[ "$_size" =~ ^[0-9]+$ ]] && (( _size > ERROR_LOG_MAX_BYTES )); then
+            mv -f "${ERROR_LOG_FILE}.1" "${ERROR_LOG_FILE}.2" 2>/dev/null || true
+            mv -f "$ERROR_LOG_FILE" "${ERROR_LOG_FILE}.1" 2>/dev/null || true
+        fi
+    fi
+    # Контекст: имя функции и строка вызывающего log_error.
+    # FUNCNAME[2] / BASH_LINENO[1] — фрейм через два уровня:
+    # _error_log_write -> log_error -> caller.
+    local func="${FUNCNAME[2]:-main}"
+    local line="${BASH_LINENO[1]:-?}"
+    local inst="${INST_NAME:-${SELECTED_INSTANCE:-${CLI_INSTANCE:-}}}"
+    local inst_tag=""
+    [[ -n "$inst" ]] && inst_tag=" [inst=${inst}]"
+    local ts
+    ts=$(date '+%Y-%m-%dT%H:%M:%S%z' 2>/dev/null || date)
+    {
+        printf '%s %s [%s@%s]%s %s\n' \
+            "$ts" "$level" "$func" "$line" "$inst_tag" "$msg"
+    } >> "$ERROR_LOG_FILE" 2>/dev/null || true
+}
 
 # Создаёт сжатый tar-архив. Если установлен pv — выводит прогресс по
 # размеру входных данных. Иначе обычный tar -czf.
@@ -3390,6 +3437,7 @@ do_tools_menu() {
         echo "  4) Дисковое пространство"
         echo "  5) Открытые порты 1С"
         echo "  6) Диагностика инстанса"
+        echo "  7) Журнал ошибок"
         echo ""
         echo "  0) ← Назад"
         echo ""
@@ -3440,10 +3488,151 @@ do_tools_menu() {
                     echo ""; do_diagnose; read -rp "  Нажмите Enter..." _
                 fi
                 ;;
+            7) do_error_log_menu ;;
             0) return ;;
             *) log_warn "Неверный выбор" ;;
         esac
     done
+}
+
+# Меню работы с журналом ошибок (manager.log).
+do_error_log_menu() {
+    while true; do
+        echo ""
+        echo -e "${BOLD}══════════════════════════════════════════════════${NC}"
+        echo -e "  Журнал ошибок"
+        echo -e "${BOLD}══════════════════════════════════════════════════${NC}"
+        echo ""
+        echo "  Файл: ${ERROR_LOG_FILE}"
+        local _size _lines
+        if [[ -f "$ERROR_LOG_FILE" ]]; then
+            _size=$(du -h "$ERROR_LOG_FILE" 2>/dev/null | awk '{print $1}')
+            _lines=$(wc -l < "$ERROR_LOG_FILE" 2>/dev/null || echo 0)
+            echo "  Размер: ${_size:-?}, строк: ${_lines:-0}"
+        else
+            echo "  (файла ещё нет — ошибок не было записано)"
+        fi
+        if [[ -f "${ERROR_LOG_FILE}.1" ]]; then
+            local _size1
+            _size1=$(du -h "${ERROR_LOG_FILE}.1" 2>/dev/null | awk '{print $1}')
+            echo "  Архив:  ${ERROR_LOG_FILE}.1 [${_size1:-?}]"
+        fi
+        echo ""
+        echo "  1) Показать последние 50 ошибок"
+        echo "  2) Показать последние N (укажу сам)"
+        echo "  3) Поиск по подстроке (grep)"
+        echo "  4) Следить в реальном времени (tail -f)"
+        echo "  5) Очистить журнал"
+        echo ""
+        echo "  0) ← Назад"
+        echo ""
+        read -rp "  Выберите: " ch
+        case $ch in
+            1) error_log_show 50 ;;
+            2)
+                read -rp "  Сколько последних строк [50]: " n
+                n="${n:-50}"
+                if [[ "$n" =~ ^[0-9]+$ ]] && (( n > 0 )); then
+                    error_log_show "$n"
+                else
+                    log_warn "Нужно положительное число"
+                fi
+                ;;
+            3)
+                read -rp "  Шаблон (поддерживается regex): " pat
+                if [[ -z "$pat" ]]; then
+                    log_warn "Шаблон пустой"
+                    continue
+                fi
+                error_log_grep "$pat"
+                ;;
+            4)
+                if [[ ! -f "$ERROR_LOG_FILE" ]]; then
+                    log_warn "Файла ещё нет — запустится сразу как только появится"
+                fi
+                echo ""
+                echo "  (Ctrl+C для выхода)"
+                # tail -F переоткрывает файл при ротации
+                tail -F "$ERROR_LOG_FILE" 2>/dev/null || true
+                ;;
+            5)
+                if [[ ! -f "$ERROR_LOG_FILE" && ! -f "${ERROR_LOG_FILE}.1" && ! -f "${ERROR_LOG_FILE}.2" ]]; then
+                    log_warn "Чистить нечего — файлов нет"
+                    continue
+                fi
+                if confirm "Удалить журнал и все архивы (.1, .2)?" no; then
+                    rm -f "$ERROR_LOG_FILE" "${ERROR_LOG_FILE}.1" "${ERROR_LOG_FILE}.2"
+                    log_info "Журнал очищен"
+                fi
+                ;;
+            0) return ;;
+            *) log_warn "Неверный выбор" ;;
+        esac
+    done
+}
+
+# Показывает последние N строк журнала с подсветкой уровня.
+error_log_show() {
+    local n="${1:-50}"
+    if [[ ! -f "$ERROR_LOG_FILE" ]]; then
+        echo ""
+        echo "  (журнал пуст или ещё не создан)"
+        read -rp "  Нажмите Enter..." _
+        return
+    fi
+    echo ""
+    echo -e "  ${BOLD}Последние ${n} записей${NC}  (файл: ${ERROR_LOG_FILE})"
+    echo "  ─────────────────────────────────────────────────────────────────"
+    tail -n "$n" "$ERROR_LOG_FILE" | while IFS= read -r line; do
+        if [[ "$line" == *" ERROR "* ]]; then
+            echo -e "  ${RED}${line}${NC}"
+        elif [[ "$line" == *" WARN "* ]]; then
+            echo -e "  ${YELLOW}${line}${NC}"
+        else
+            echo "  ${line}"
+        fi
+    done
+    echo ""
+    read -rp "  Нажмите Enter..." _
+}
+
+# Поиск по журналу. Ищет и в текущем файле, и в архиве .1/.2.
+error_log_grep() {
+    local pat="$1"
+    local files=()
+    [[ -f "${ERROR_LOG_FILE}.2" ]] && files+=("${ERROR_LOG_FILE}.2")
+    [[ -f "${ERROR_LOG_FILE}.1" ]] && files+=("${ERROR_LOG_FILE}.1")
+    [[ -f "$ERROR_LOG_FILE" ]]     && files+=("$ERROR_LOG_FILE")
+    if [[ ${#files[@]} -eq 0 ]]; then
+        echo ""
+        echo "  (журнал пуст)"
+        read -rp "  Нажмите Enter..." _
+        return
+    fi
+    echo ""
+    echo -e "  Поиск по шаблону: ${CYAN}${pat}${NC}"
+    echo "  ─────────────────────────────────────────────────────────────────"
+    local total=0
+    local f
+    for f in "${files[@]}"; do
+        local matches
+        matches=$(grep -E -- "$pat" "$f" 2>/dev/null || true)
+        if [[ -n "$matches" ]]; then
+            local count
+            count=$(printf '%s\n' "$matches" | wc -l)
+            echo -e "  ${BOLD}$(basename "$f")${NC}  (${count} совпадений)"
+            printf '%s\n' "$matches" | sed 's/^/    /'
+            echo ""
+            total=$((total + count))
+        fi
+    done
+    if (( total == 0 )); then
+        echo "  (нет совпадений)"
+    else
+        echo "  Всего совпадений: ${total}"
+    fi
+    echo ""
+    read -rp "  Нажмите Enter..." _
 }
 
 do_system_info() {
@@ -3933,6 +4122,8 @@ do_help() {
     echo "    sudo ./crserver-manager.sh diagnose                диагностика"
     echo "    sudo ./crserver-manager.sh healthcheck             одностроковый OK/FAIL для мониторинга"
     echo "    sudo ./crserver-manager.sh verify <архив>          проверить целостность tar-архива"
+    echo "    sudo ./crserver-manager.sh errors [N|--grep p|--follow|--clear|--path]"
+    echo "                                                       журнал ошибок (${ERROR_LOG_FILE})"
     echo "    sudo ./crserver-manager.sh versions                список платформ"
     echo "    sudo ./crserver-manager.sh path-install/path-remove"
     echo ""
@@ -4691,6 +4882,54 @@ case "${1:-}" in
     uninstall)     do_full_uninstall ;;
     start|stop|restart|status|logs|backup|diagnose|healthcheck)
         cli_run_on_instance "$1"
+        ;;
+    errors|errorlog|error-log)
+        # crserver errors [N|--grep PATTERN|--clear|--path|--follow]
+        # По умолчанию — последние 50 строк журнала ошибок.
+        case "${2:-}" in
+            "")            error_log_show 50 ;;
+            --path)        echo "$ERROR_LOG_FILE" ;;
+            --clear)
+                if confirm "Очистить ${ERROR_LOG_FILE} (включая .1, .2)?" no; then
+                    rm -f "$ERROR_LOG_FILE" "${ERROR_LOG_FILE}.1" "${ERROR_LOG_FILE}.2"
+                    log_info "Журнал очищен"
+                fi
+                ;;
+            --follow|-f)
+                tail -F "$ERROR_LOG_FILE" 2>/dev/null || true
+                ;;
+            --grep)
+                if [[ -z "${3:-}" ]]; then
+                    log_error "Использование: $0 errors --grep <шаблон>"
+                    exit 1
+                fi
+                error_log_grep "$3"
+                ;;
+            -h|--help|help)
+                cat <<EOF
+Использование: $0 errors [команда]
+
+Команды:
+  (без аргументов)        последние 50 строк журнала
+  N                       последние N строк
+  --grep <pattern>        поиск по подстроке/regex (включая архивы .1, .2)
+  --follow, -f            tail -F (следить в реальном времени)
+  --clear                 очистить журнал и архивы (требует подтверждения)
+  --path                  напечатать путь к файлу журнала и выйти
+
+Журнал: ${ERROR_LOG_FILE}
+EOF
+                ;;
+            *)
+                # Если число — показываем N строк.
+                if [[ "${2}" =~ ^[0-9]+$ ]]; then
+                    error_log_show "$2"
+                else
+                    log_error "Неизвестный аргумент: $2 (см. $0 errors --help)"
+                    exit 1
+                fi
+                ;;
+        esac
         ;;
     backup-verify|verify)
         # crserver verify <архив.tar.gz> — без -i, проверка любого архива.

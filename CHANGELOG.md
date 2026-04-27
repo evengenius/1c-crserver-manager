@@ -7,7 +7,41 @@
 
 См. [ROADMAP.md](ROADMAP.md).
 
-## [2.1.4] — 2026-04-27
+## [2.2.0] — 2026-04-27
+
+### Журнал ошибок
+- Все вызовы `log_error` теперь дублируются в файл
+  `/var/log/1c-crserver/manager.log` с timestamp, уровнем, именем
+  функции и номером строки в скрипте, плюс контекст инстанса
+  (`[inst=name]`), если он задан.
+- Ротация по размеру: при превышении 5 MiB текущий файл сохраняется
+  как `.1`, предыдущий `.1` уходит в `.2`, более старые удаляются.
+- Сбой записи (нет прав, диск полон) **не падает в скрипте** — лог
+  просто молча пропускается, чтобы не создавать вторичные ошибки.
+- Файл создаётся только при первой реальной ошибке — если ошибок не
+  было, нет и файла.
+
+### Меню «Инструменты → Журнал ошибок» (пункт 7)
+- Показать последние 50/N записей с цветной подсветкой уровня.
+- Поиск по подстроке/regex (`grep -E`) с прохождением по архивам
+  `.1` и `.2`.
+- `tail -F` для слежения в реальном времени (переоткрывает файл
+  при ротации).
+- Очистка журнала со всеми архивами (с подтверждением).
+
+### CLI команда `errors`
+- `crserver errors` — последние 50 строк
+- `crserver errors 200` — последние N
+- `crserver errors --grep <pattern>` — поиск по архивам
+- `crserver errors --follow` (`-f`) — tail -F
+- `crserver errors --clear` — очистить
+- `crserver errors --path` — напечатать путь к файлу
+- `crserver errors --help` — справка
+- bash-completion расширен для всех опций.
+
+### Документация
+- README получил раздел «Журнал ошибок» в Troubleshooting с примерами
+  CLI, локацией файла и описанием ротации.
 
 ### Восстановление хранилищ
 - В меню «Хранилища → Восстановить» добавлен **выбор сценария**, когда
@@ -240,7 +274,8 @@ REPO_DIR, LOG_DIR), своя версия платформы, свои хран�
 
 См. историю в `git log`.
 
-[Unreleased]: https://github.com/evengenius/1c-crserver-manager/compare/v2.1.4...HEAD
+[Unreleased]: https://github.com/evengenius/1c-crserver-manager/compare/v2.2.0...HEAD
+[2.2.0]: https://github.com/evengenius/1c-crserver-manager/compare/v2.1.4...v2.2.0
 [2.1.4]: https://github.com/evengenius/1c-crserver-manager/compare/v2.1.3...v2.1.4
 [2.1.3]: https://github.com/evengenius/1c-crserver-manager/compare/v2.1.2...v2.1.3
 [2.1.2]: https://github.com/evengenius/1c-crserver-manager/compare/v2.1.1...v2.1.2

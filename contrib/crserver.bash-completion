@@ -83,7 +83,7 @@ _crserver() {
     fi
 
     # Корневые команды
-    local root_cmds="install uninstall start stop restart status logs backup diagnose healthcheck verify repo instance versions path-install path-remove update version help -i --instance"
+    local root_cmds="install uninstall start stop restart status logs backup diagnose healthcheck verify errors repo instance versions path-install path-remove update version help -i --instance"
     if [[ -z "$cmd" ]]; then
         COMPREPLY=( $(compgen -W "$root_cmds" -- "$cur") )
         return 0
@@ -152,6 +152,10 @@ _crserver() {
         verify|backup-verify)
             # Файл архива
             COMPREPLY=( $(compgen -f -X '!*.tar.gz' -- "$cur") )
+            return 0
+            ;;
+        errors|errorlog|error-log)
+            COMPREPLY=( $(compgen -W "--grep --follow -f --clear --path --help" -- "$cur") )
             return 0
             ;;
     esac

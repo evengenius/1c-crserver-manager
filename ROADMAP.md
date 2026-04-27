@@ -28,8 +28,10 @@
 - ⏳ Миграция всех `read -rp ... (y/N)` на `confirm`-helper
 - ⏳ Подтверждение деструктивных операций унифицировано (имя инстанса
   везде, `DELETE` только для full-uninstall)
-- ⏳ Единый `log_to_file` в `/var/log/1c-crserver/manager.log` для аудита
-  действий
+- ✅ Единый `log_to_file` в `/var/log/1c-crserver/manager.log` для аудита
+  ошибок (v2.2.0). Только `log_error` пишется в файл. Меню/CLI для
+  чтения. Ротация по размеру (5 MiB). Расширить захват `log_warn` —
+  отдельный пункт ниже, если потребуется.
 
 ### Автоматизация
 - ✅ Bash-completion для всех CLI-команд (v2.0.4, `contrib/crserver.bash-completion`)
