@@ -7,7 +7,22 @@
 
 См. [ROADMAP.md](ROADMAP.md).
 
-## [2.2.0] — 2026-04-27
+## [2.2.1] — 2026-04-27
+
+### Hotfix
+- Регрессия v2.1.4: проверка «top-level в архиве — директория» падала
+  ложноположительно на нормальных бэкапах. Причина: `grep` без `-E`
+  трактовал альтернацию `\|` в BRE по-разному на разных системах
+  (на Debian-сервере `\|` не работало как «или», а как литерал).
+  Меню «Хранилища → Восстановить» отказывало с ошибкой
+  «top-level не является директорией» даже для архивов, созданных
+  тем же скриптом.
+- Заменено на `awk`-проверку, которая не зависит от BRE/ERE и
+  одинаково работает на всех системах. Покрытие тестов:
+  - архив с `name/` trailing-slash entry — PASS;
+  - архив только с файлами `name/...` без отдельной записи каталога — PASS;
+  - архив, где `name` — это файл (без слеша) — правильно отклоняется;
+  - имя-префикс другого имени (`foo` vs `foobar`) — без ложных матчей.
 
 ### Журнал ошибок
 - Все вызовы `log_error` теперь дублируются в файл
@@ -274,7 +289,8 @@ REPO_DIR, LOG_DIR), своя версия платформы, свои хран�
 
 См. историю в `git log`.
 
-[Unreleased]: https://github.com/evengenius/1c-crserver-manager/compare/v2.2.0...HEAD
+[Unreleased]: https://github.com/evengenius/1c-crserver-manager/compare/v2.2.1...HEAD
+[2.2.1]: https://github.com/evengenius/1c-crserver-manager/compare/v2.2.0...v2.2.1
 [2.2.0]: https://github.com/evengenius/1c-crserver-manager/compare/v2.1.4...v2.2.0
 [2.1.4]: https://github.com/evengenius/1c-crserver-manager/compare/v2.1.3...v2.1.4
 [2.1.3]: https://github.com/evengenius/1c-crserver-manager/compare/v2.1.2...v2.1.3

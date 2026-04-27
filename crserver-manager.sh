@@ -33,7 +33,7 @@ set -euo pipefail
 # --- Версия скрипта ---
 # При выпуске новой версии увеличить и закоммитить в репозиторий.
 # Используется для проверки обновлений (см. do_self_update).
-SCRIPT_VERSION="2.2.0"
+SCRIPT_VERSION="2.2.1"
 
 # --- Источник обновлений ---
 UPDATE_REPO="evengenius/1c-crserver-manager"
@@ -2432,10 +2432,19 @@ do_repo_restore() {
         return 1
     fi
 
-    # Проверим, что в архиве top-level именно ДИРЕКТОРИЯ (entry с trailing /),
-    # а не файл с этим именем — иначе после tar -xzf вместо хранилища
-    # на диске окажется обычный файл, и хранилища как такового не будет.
-    if ! tar -tzf "$archive" 2>/dev/null | grep -q "^${orig_name}/$\|^${orig_name}/."; then
+    # Проверим, что в архиве top-level именно ДИРЕКТОРИЯ — то есть есть
+    # либо запись с trailing slash (orig_name/), либо хотя бы один путь
+    # вида orig_name/<что-то>. Если нет ничего из этого, значит в архиве
+    # лежит файл с таким именем без слеша — после tar -xzf на диск
+    # ляжет файл, не директория.
+    # Используем awk вместо grep: он не зависит от BRE/ERE и одинаково
+    # ведёт себя на всех системах.
+    if ! tar -tzf "$archive" 2>/dev/null | \
+            awk -v n="$orig_name" '
+                $0 == n"/" { found=1; exit }
+                index($0, n"/") == 1 && length($0) > length(n)+1 { found=1; exit }
+                END { exit !found }
+            '; then
         log_error "В архиве top-level '${orig_name}' не является директорией"
         return 1
     fi
@@ -4737,7 +4746,12 @@ cli_run_on_instance() {
                         log_error "Имя в архиве не похоже на имя хранилища: '${orig_name}'"
                         return 1
                     fi
-                    if ! tar -tzf "$archive" 2>/dev/null | grep -q "^${orig_name}/$\|^${orig_name}/."; then
+                    if ! tar -tzf "$archive" 2>/dev/null | \
+                            awk -v n="$orig_name" '
+                                $0 == n"/" { found=1; exit }
+                                index($0, n"/") == 1 && length($0) > length(n)+1 { found=1; exit }
+                                END { exit !found }
+                            '; then
                         log_error "В архиве top-level '${orig_name}' не является директорией"
                         return 1
                     fi
