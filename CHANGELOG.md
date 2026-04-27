@@ -7,6 +7,49 @@
 
 См. [ROADMAP.md](ROADMAP.md).
 
+## [2.2.3] — 2026-04-27
+
+### Hotfix (КРИТИЧЕСКИЙ, потеря данных)
+В сценарии «восстановить под другим именем» (v2.1.4–2.2.2) был
+серьёзный баг: `tar -xzf` распаковывал архив **поверх живой
+директории** хранилища с тем же исходным именем, после чего
+`mv orig new` либо falling, либо приводил к смешанному содержимому.
+
+Симптомы у пользователя:
+- В меню «Хранилища» исходное хранилище исчезало
+- Появлялась запись с новым именем, но без директории
+- Директория старого имени оставалась с непредсказуемым содержимым
+
+**Полностью переписан алгоритм через staging-каталог:**
+1. `mktemp -d` создаёт `${INST_REPO_DIR}/.restore-staging.<rnd>` (на той
+   же ФС, чтобы `mv` был атомарным).
+2. `tar -xzf $archive -C $staging` распаковывает в staging — **живые
+   данные не трогаются**.
+3. Если `target` уже есть и мы заменяем — отодвигаем в `.pre-restore.<ts>`.
+4. `mv staging/orig_name → target` — атомарно.
+5. Удаляем staging.
+
+При любой ошибке на любом шаге — staging-каталог удаляется,
+.pre-restore возвращается обратно, скрипт стартует службу. Никакого
+смешения данных больше не происходит.
+
+Применено к **обоим** местам: `do_repo_restore` (меню) и CLI
+`repo restore`.
+
+### Качество отображения
+- `get_repo_list` теперь фильтрует:
+  - `*.pre-restore.*` rollback-каталоги — они не должны показываться
+    как полноценные хранилища в меню;
+  - `.*` (скрытые служебные);
+  - имена, не проходящие `validate_repo_name`.
+
+### Тесты
+- T1 (restore as new): `myrepo` сохраняет live-data, `myrepo_restored`
+  получает backup-data.
+- T2 (replace): `myrepo` получает backup-data, live уходит в
+  `myrepo.pre-restore.<ts>`.
+- T3 (фильтрация): pre-restore не виден в списке.
+
 ## [2.2.2] — 2026-04-27
 
 ### Hotfix
@@ -301,7 +344,8 @@ REPO_DIR, LOG_DIR), своя версия платформы, свои хран�
 
 См. историю в `git log`.
 
-[Unreleased]: https://github.com/evengenius/1c-crserver-manager/compare/v2.2.2...HEAD
+[Unreleased]: https://github.com/evengenius/1c-crserver-manager/compare/v2.2.3...HEAD
+[2.2.3]: https://github.com/evengenius/1c-crserver-manager/compare/v2.2.2...v2.2.3
 [2.2.2]: https://github.com/evengenius/1c-crserver-manager/compare/v2.2.1...v2.2.2
 [2.2.1]: https://github.com/evengenius/1c-crserver-manager/compare/v2.2.0...v2.2.1
 [2.2.0]: https://github.com/evengenius/1c-crserver-manager/compare/v2.1.4...v2.2.0

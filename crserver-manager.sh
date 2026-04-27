@@ -33,7 +33,7 @@ set -euo pipefail
 # --- Версия скрипта ---
 # При выпуске новой версии увеличить и закоммитить в репозиторий.
 # Используется для проверки обновлений (см. do_self_update).
-SCRIPT_VERSION="2.2.2"
+SCRIPT_VERSION="2.2.3"
 
 # --- Источник обновлений ---
 UPDATE_REPO="evengenius/1c-crserver-manager"
@@ -2004,15 +2004,24 @@ validate_repo_name() {
     return 0
 }
 
-# Заполняет массив (имя массива в $1) подкаталогами в INST_REPO_DIR
+# Заполняет массив (имя массива в $1) подкаталогами в INST_REPO_DIR.
+# Пропускает служебные каталоги: pre-restore-rollback (имя.pre-restore.<ts>)
+# и недопустимые имена (точка в начале, спецсимволы — это явно не хранилища).
 get_repo_list() {
     local _out_var="$1"
     local _result=()
     if [[ -d "$INST_REPO_DIR" ]]; then
-        local _dir
+        local _dir _name
         for _dir in "$INST_REPO_DIR"/*/; do
             [[ -d "$_dir" ]] || continue
-            _result+=("$(basename "$_dir")")
+            _name=$(basename "$_dir")
+            # Пропускаем pre-restore-rollback'и
+            [[ "$_name" == *.pre-restore.* ]] && continue
+            # Скрытые/служебные (на всякий случай — glob */ их не ловит, но мало ли)
+            [[ "$_name" == .* ]] && continue
+            # Только валидные имена хранилищ
+            validate_repo_name "$_name" || continue
+            _result+=("$_name")
         done
     fi
     local -n _ref="$_out_var"
@@ -2521,24 +2530,29 @@ do_repo_restore() {
         sleep 1
     fi
 
-    # Страховка: если заменяем существующее — отодвигаем в .pre-restore.
-    local rollback_dir=""
-    if [[ -e "$target" ]]; then
-        rollback_dir="${target}.pre-restore.$(date +%s)"
-        mv "$target" "$rollback_dir"
-    fi
+    # Алгоритм:
+    # 1. Распаковываем во ВРЕМЕННЫЙ staging-каталог (он же на той же ФС,
+    #    что REPO_DIR, поэтому mv будет атомарным).
+    # 2. Если заменяем существующее — отодвигаем старое в .pre-restore.
+    # 3. mv staging/orig_name → target.
+    # 4. Удаляем staging-каталог.
+    # Это безопаснее, чем распаковка в REPO_DIR с риском перезаписи живых
+    # данных, и работает одинаково для replace и rename-сценариев.
+    local staging
+    staging=$(mktemp -d "${INST_REPO_DIR}/.restore-staging.XXXXXX") || {
+        log_error "Не удалось создать временный каталог в ${INST_REPO_DIR}"
+        if [[ $was_active -eq 1 ]]; then
+            systemctl start "$unit" 2>/dev/null || true
+        fi
+        return 1
+    }
 
-    log_step "Распаковка архива..."
-    if ! tar -xzf "$archive" -C "$INST_REPO_DIR" 2>/tmp/crserver-tar.log; then
+    log_step "Распаковка архива в ${staging}..."
+    if ! tar -xzf "$archive" -C "$staging" 2>/tmp/crserver-tar.log; then
         log_error "Ошибка распаковки:"
         tail -5 /tmp/crserver-tar.log | sed 's/^/    /'
         rm -f /tmp/crserver-tar.log
-        # Откат
-        rm -rf "${INST_REPO_DIR:?}/${orig_name:?}" 2>/dev/null || true
-        if [[ -n "$rollback_dir" ]]; then
-            log_warn "Восстанавливаю предыдущее состояние..."
-            mv "$rollback_dir" "$target"
-        fi
+        rm -rf "$staging" 2>/dev/null || true
         if [[ $was_active -eq 1 ]]; then
             systemctl start "$unit" 2>/dev/null || true
         fi
@@ -2546,15 +2560,25 @@ do_repo_restore() {
     fi
     rm -f /tmp/crserver-tar.log
 
-    # Если восстанавливаем под другим именем — переименуем распакованный
-    # каталог из orig_name в target_name.
-    if [[ "$target_name" != "$orig_name" ]]; then
-        if ! mv "${INST_REPO_DIR}/${orig_name}" "$target"; then
-            log_error "Не удалось переименовать ${orig_name} → ${target_name}"
-            rm -rf "${INST_REPO_DIR:?}/${orig_name:?}" 2>/dev/null || true
-            if [[ -n "$rollback_dir" ]]; then
-                mv "$rollback_dir" "${INST_REPO_DIR}/${orig_name}"
-            fi
+    # Проверим, что в staging действительно появилась директория с
+    # ожидаемым именем. Если её нет — что-то не так с архивом.
+    local extracted="${staging}/${orig_name}"
+    if [[ ! -d "$extracted" ]]; then
+        log_error "После распаковки '${extracted}' не является директорией"
+        rm -rf "$staging" 2>/dev/null || true
+        if [[ $was_active -eq 1 ]]; then
+            systemctl start "$unit" 2>/dev/null || true
+        fi
+        return 1
+    fi
+
+    # Если заменяем существующее target — отодвигаем в .pre-restore.
+    local rollback_dir=""
+    if [[ -e "$target" ]]; then
+        rollback_dir="${target}.pre-restore.$(date +%s)"
+        if ! mv "$target" "$rollback_dir"; then
+            log_error "Не удалось переименовать существующий ${target} в .pre-restore"
+            rm -rf "$staging" 2>/dev/null || true
             if [[ $was_active -eq 1 ]]; then
                 systemctl start "$unit" 2>/dev/null || true
             fi
@@ -2562,13 +2586,31 @@ do_repo_restore() {
         fi
     fi
 
-    # Post-condition: на диске ДОЛЖНА появиться директория хранилища.
+    # Перемещаем из staging в target. На той же ФС mv — атомарный rename.
+    if ! mv "$extracted" "$target"; then
+        log_error "Не удалось переместить ${extracted} → ${target}"
+        rm -rf "$staging" 2>/dev/null || true
+        # Если откатывали существующее — возвращаем
+        if [[ -n "$rollback_dir" && ! -e "$target" ]]; then
+            mv "$rollback_dir" "$target" 2>/dev/null || true
+        fi
+        if [[ $was_active -eq 1 ]]; then
+            systemctl start "$unit" 2>/dev/null || true
+        fi
+        return 1
+    fi
+
+    # Чистим staging (там может остаться, например, лишний content если
+    # архив содержал ещё что-то на верхнем уровне — мы это игнорируем).
+    rm -rf "$staging" 2>/dev/null || true
+
+    # Post-condition
     if [[ ! -d "$target" ]]; then
-        log_error "После распаковки '${target}' не является директорией. Возможно, архив повреждён или содержит файл вместо каталога."
-        # Откат
+        log_error "Post-condition fail: '${target}' не директория после restore"
+        # Пробуем откатить существующее
         if [[ -n "$rollback_dir" ]]; then
             rm -f "$target" 2>/dev/null || true
-            mv "$rollback_dir" "$target"
+            mv "$rollback_dir" "$target" 2>/dev/null || true
         fi
         if [[ $was_active -eq 1 ]]; then
             systemctl start "$unit" 2>/dev/null || true
@@ -4785,42 +4827,72 @@ cli_run_on_instance() {
                         sleep 1
                     fi
 
-                    local rollback_dir=""
-                    if [[ -e "$target" ]]; then
-                        rollback_dir="${target}.pre-restore.$(date +%s)"
-                        mv "$target" "$rollback_dir"
-                    fi
-                    if ! tar -xzf "$archive" -C "$INST_REPO_DIR" 2>/dev/null; then
+                    # Распаковка через staging-каталог (см. v2.2.3 в do_repo_restore).
+                    # Это безопасно для replace и rename-сценариев одинаково.
+                    local staging
+                    staging=$(mktemp -d "${INST_REPO_DIR}/.restore-staging.XXXXXX") || {
+                        log_error "Не удалось создать staging-каталог"
+                        if [[ $was_active -eq 1 ]]; then
+                            systemctl start "$unit" 2>/dev/null || true
+                        fi
+                        return 1
+                    }
+                    if ! tar -xzf "$archive" -C "$staging" 2>/dev/null; then
                         log_error "Ошибка распаковки"
-                        rm -rf "${INST_REPO_DIR:?}/${orig_name:?}" 2>/dev/null || true
-                        [[ -n "$rollback_dir" ]] && mv "$rollback_dir" "$target"
+                        rm -rf "$staging" 2>/dev/null || true
                         if [[ $was_active -eq 1 ]]; then
                             systemctl start "$unit" 2>/dev/null || true
                         fi
                         return 1
                     fi
-                    if [[ "$target_name" != "$orig_name" ]]; then
-                        if ! mv "${INST_REPO_DIR}/${orig_name}" "$target"; then
-                            log_error "Не удалось переименовать ${orig_name} → ${target_name}"
-                            rm -rf "${INST_REPO_DIR:?}/${orig_name:?}" 2>/dev/null || true
-                            [[ -n "$rollback_dir" ]] && mv "$rollback_dir" "${INST_REPO_DIR}/${orig_name}"
+                    local extracted="${staging}/${orig_name}"
+                    if [[ ! -d "$extracted" ]]; then
+                        log_error "После распаковки '${extracted}' не директория"
+                        rm -rf "$staging" 2>/dev/null || true
+                        if [[ $was_active -eq 1 ]]; then
+                            systemctl start "$unit" 2>/dev/null || true
+                        fi
+                        return 1
+                    fi
+
+                    local rollback_dir=""
+                    if [[ -e "$target" ]]; then
+                        rollback_dir="${target}.pre-restore.$(date +%s)"
+                        if ! mv "$target" "$rollback_dir"; then
+                            log_error "Не удалось переименовать существующий ${target}"
+                            rm -rf "$staging" 2>/dev/null || true
                             if [[ $was_active -eq 1 ]]; then
                                 systemctl start "$unit" 2>/dev/null || true
                             fi
                             return 1
                         fi
                     fi
-                    if [[ ! -d "$target" ]]; then
-                        log_error "После распаковки '${target}' не директория. Архив повреждён?"
-                        if [[ -n "$rollback_dir" ]]; then
-                            rm -f "$target" 2>/dev/null || true
-                            mv "$rollback_dir" "$target"
+
+                    if ! mv "$extracted" "$target"; then
+                        log_error "Не удалось переместить ${extracted} → ${target}"
+                        rm -rf "$staging" 2>/dev/null || true
+                        if [[ -n "$rollback_dir" && ! -e "$target" ]]; then
+                            mv "$rollback_dir" "$target" 2>/dev/null || true
                         fi
                         if [[ $was_active -eq 1 ]]; then
                             systemctl start "$unit" 2>/dev/null || true
                         fi
                         return 1
                     fi
+                    rm -rf "$staging" 2>/dev/null || true
+
+                    if [[ ! -d "$target" ]]; then
+                        log_error "Post-condition fail: '${target}' не директория"
+                        if [[ -n "$rollback_dir" ]]; then
+                            rm -f "$target" 2>/dev/null || true
+                            mv "$rollback_dir" "$target" 2>/dev/null || true
+                        fi
+                        if [[ $was_active -eq 1 ]]; then
+                            systemctl start "$unit" 2>/dev/null || true
+                        fi
+                        return 1
+                    fi
+
                     detect_1c_user
                     if [[ -n "${SVC_USER:-}" && -n "${SVC_GROUP:-}" ]]; then
                         chown -R "${SVC_USER}:${SVC_GROUP}" "$target" 2>/dev/null || true
