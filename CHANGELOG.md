@@ -7,7 +7,19 @@
 
 См. [ROADMAP.md](ROADMAP.md).
 
-## [2.2.1] — 2026-04-27
+## [2.2.2] — 2026-04-27
+
+### Hotfix
+- v2.2.1 заменил `grep "\|"` на `awk` для проверки top-level в архиве,
+  но на серверах с **mawk** (Debian/Ubuntu по умолчанию) проверка
+  снова отказывала на нормальных бэкапах. mawk не всегда корректно
+  обрабатывает `index() == 1 && length(...)` в одном предикате.
+- Третья итерация фикса: переписано на **чистый bash** (`case` с
+  глобами, `while read` от `tar -tzf`). Не зависит ни от grep
+  (BRE/ERE), ни от awk-реализации (gawk/mawk/busybox).
+- Тесты на 7 кейсах: норм директория, файл вместо директории,
+  только файлы внутри без trailing-slash entry, имя-префикс другого
+  (foo vs foobar), реалистичный 1С-репозиторий с `1cv8ddb.lst`.
 
 ### Hotfix
 - Регрессия v2.1.4: проверка «top-level в архиве — директория» падала
@@ -289,7 +301,8 @@ REPO_DIR, LOG_DIR), своя версия платформы, свои хран�
 
 См. историю в `git log`.
 
-[Unreleased]: https://github.com/evengenius/1c-crserver-manager/compare/v2.2.1...HEAD
+[Unreleased]: https://github.com/evengenius/1c-crserver-manager/compare/v2.2.2...HEAD
+[2.2.2]: https://github.com/evengenius/1c-crserver-manager/compare/v2.2.1...v2.2.2
 [2.2.1]: https://github.com/evengenius/1c-crserver-manager/compare/v2.2.0...v2.2.1
 [2.2.0]: https://github.com/evengenius/1c-crserver-manager/compare/v2.1.4...v2.2.0
 [2.1.4]: https://github.com/evengenius/1c-crserver-manager/compare/v2.1.3...v2.1.4

@@ -33,7 +33,7 @@ set -euo pipefail
 # --- Версия скрипта ---
 # При выпуске новой версии увеличить и закоммитить в репозиторий.
 # Используется для проверки обновлений (см. do_self_update).
-SCRIPT_VERSION="2.2.1"
+SCRIPT_VERSION="2.2.2"
 
 # --- Источник обновлений ---
 UPDATE_REPO="evengenius/1c-crserver-manager"
@@ -2433,18 +2433,19 @@ do_repo_restore() {
     fi
 
     # Проверим, что в архиве top-level именно ДИРЕКТОРИЯ — то есть есть
-    # либо запись с trailing slash (orig_name/), либо хотя бы один путь
-    # вида orig_name/<что-то>. Если нет ничего из этого, значит в архиве
-    # лежит файл с таким именем без слеша — после tar -xzf на диск
-    # ляжет файл, не директория.
-    # Используем awk вместо grep: он не зависит от BRE/ERE и одинаково
-    # ведёт себя на всех системах.
-    if ! tar -tzf "$archive" 2>/dev/null | \
-            awk -v n="$orig_name" '
-                $0 == n"/" { found=1; exit }
-                index($0, n"/") == 1 && length($0) > length(n)+1 { found=1; exit }
-                END { exit !found }
-            '; then
+    # хотя бы одна запись либо с trailing slash (orig_name/), либо с
+    # подкаталогом/файлом (orig_name/что-то). Если нет ничего такого —
+    # значит в архиве top-level это файл с таким именем без слеша,
+    # и после tar -xzf на диск ляжет файл, а не каталог хранилища.
+    # Используем чистый bash (case с глобами): не зависим от
+    # реализации grep (BRE/ERE) и awk (gawk/mawk/busybox).
+    local _entry _has_dir_form=0
+    while IFS= read -r _entry; do
+        case "$_entry" in
+            "${orig_name}"/|"${orig_name}"/?*) _has_dir_form=1; break ;;
+        esac
+    done < <(tar -tzf "$archive" 2>/dev/null)
+    if (( _has_dir_form == 0 )); then
         log_error "В архиве top-level '${orig_name}' не является директорией"
         return 1
     fi
@@ -4746,12 +4747,14 @@ cli_run_on_instance() {
                         log_error "Имя в архиве не похоже на имя хранилища: '${orig_name}'"
                         return 1
                     fi
-                    if ! tar -tzf "$archive" 2>/dev/null | \
-                            awk -v n="$orig_name" '
-                                $0 == n"/" { found=1; exit }
-                                index($0, n"/") == 1 && length($0) > length(n)+1 { found=1; exit }
-                                END { exit !found }
-                            '; then
+                    # Чистый bash вместо awk (см. v2.2.2 в do_repo_restore).
+                    local _entry _has_dir_form=0
+                    while IFS= read -r _entry; do
+                        case "$_entry" in
+                            "${orig_name}"/|"${orig_name}"/?*) _has_dir_form=1; break ;;
+                        esac
+                    done < <(tar -tzf "$archive" 2>/dev/null)
+                    if (( _has_dir_form == 0 )); then
                         log_error "В архиве top-level '${orig_name}' не является директорией"
                         return 1
                     fi
